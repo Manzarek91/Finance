@@ -1,56 +1,68 @@
-// Ricrea l'API window.storage (get/set/delete/list) usata dall'artifact
-// originale, appoggiandosi a localStorage del browser. Essendo un portale
-// a uso personale, il parametro "shared" viene ignorato: tutto resta
-// esclusivamente nel browser in cui apri il sito.
+// Ricrea l'API window.storage (get/set/delete/list) usata dall'app,
+// ma appoggiandosi a Supabase invece che al browser: così i dati
+// diventano accessibili da qualsiasi dispositivo dopo il login.
+// Ogni riga è vincolata al tuo utente tramite Row Level Security su Supabase.
 
-const PREFIX = "libro-mastro:";
+import { supabase } from "./supabaseClient.js";
 
-function fullKey(key) {
-  return PREFIX + key;
+let currentUserId = null;
+
+export function setStorageUser(userId) {
+  currentUserId = userId;
+}
+
+function requireUser() {
+  if (!currentUserId) {
+    throw new Error("Devi effettuare l'accesso prima di caricare o salvare dati.");
+  }
+  return currentUserId;
 }
 
 window.storage = {
   async get(key) {
-    try {
-      const raw = localStorage.getItem(fullKey(key));
-      if (raw === null) return null;
-      return { key, value: raw, shared: false };
-    } catch (e) {
-      throw new Error("Errore di lettura da localStorage: " + e.message);
-    }
+    const user_id = requireUser();
+    const { data, error } = await supabase
+      .from("kv_store")
+      .select("value")
+      .eq("user_id", user_id)
+      .eq("key", key)
+      .maybeSingle();
+    if (error) throw new Error("Errore di lettura da Supabase: " + error.message);
+    if (!data) return null;
+    return { key, value: data.value, shared: false };
   },
 
   async set(key, value) {
-    try {
-      localStorage.setItem(fullKey(key), value);
-      return { key, value, shared: false };
-    } catch (e) {
-      throw new Error("Errore di scrittura su localStorage: " + e.message);
-    }
+    const user_id = requireUser();
+    const { error } = await supabase
+      .from("kv_store")
+      .upsert(
+        { user_id, key, value, updated_at: new Date().toISOString() },
+        { onConflict: "user_id,key" }
+      );
+    if (error) throw new Error("Errore di scrittura su Supabase: " + error.message);
+    return { key, value, shared: false };
   },
 
   async delete(key) {
-    try {
-      const existed = localStorage.getItem(fullKey(key)) !== null;
-      localStorage.removeItem(fullKey(key));
-      return { key, deleted: existed, shared: false };
-    } catch (e) {
-      throw new Error("Errore di cancellazione da localStorage: " + e.message);
-    }
+    const user_id = requireUser();
+    const { error } = await supabase
+      .from("kv_store")
+      .delete()
+      .eq("user_id", user_id)
+      .eq("key", key);
+    if (error) throw new Error("Errore di cancellazione da Supabase: " + error.message);
+    return { key, deleted: true, shared: false };
   },
 
   async list(prefix = "") {
-    try {
-      const keys = [];
-      for (let i = 0; i < localStorage.length; i++) {
-        const k = localStorage.key(i);
-        if (k && k.startsWith(PREFIX + prefix)) {
-          keys.push(k.slice(PREFIX.length));
-        }
-      }
-      return { keys, prefix, shared: false };
-    } catch (e) {
-      throw new Error("Errore di lettura da localStorage: " + e.message);
-    }
+    const user_id = requireUser();
+    const { data, error } = await supabase
+      .from("kv_store")
+      .select("key")
+      .eq("user_id", user_id)
+      .like("key", `${prefix}%`);
+    if (error) throw new Error("Errore di lettura da Supabase: " + error.message);
+    return { keys: (data || []).map((r) => r.key), prefix, shared: false };
   },
 };
