@@ -29,6 +29,8 @@ import {
   AlertCircle,
   ArrowUpRight,
   ArrowDownRight,
+  ArrowLeftRight,
+  Menu,
 } from "lucide-react";
 
 // ---------------------------------------------------------------------------
@@ -109,6 +111,16 @@ const DEFAULT_CONFIG = {
   budgets: {},
   accounts: [],
 };
+
+const STATUS_OPTIONS = [
+  { value: "", label: "—" },
+  { value: "da_valutare", label: "Da valutare" },
+  { value: "cancellato", label: "Cancellato" },
+];
+
+function statusLabel(status) {
+  return STATUS_OPTIONS.find((s) => s.value === status)?.label || "—";
+}
 
 function parseAmount(raw) {
   if (raw === null || raw === undefined) return NaN;
@@ -281,6 +293,12 @@ export default function FinanceTracker() {
   const [selectedMonth, setSelectedMonth] = useState(null);
   const [accountFilter, setAccountFilter] = useState("Tutti");
   const [saveError, setSaveError] = useState("");
+  const [mobileMenuOpen, setMobileMenuOpen] = useState(false);
+
+  const goTo = (v) => {
+    setView(v);
+    setMobileMenuOpen(false);
+  };
 
   // ---- caricamento iniziale --------------------------------------------
   useEffect(() => {
@@ -402,22 +420,33 @@ export default function FinanceTracker() {
 
       {/* Sidebar */}
       <div
-        className="md:w-56 shrink-0 rounded-2xl flex md:flex-col"
+        className="md:w-56 shrink-0 rounded-2xl flex flex-col"
         style={{ background: SIDEBAR, boxShadow: SHADOW }}
       >
-        <div className="px-5 pt-6 pb-5 hidden md:block">
-          <div className="text-[10px] uppercase" style={{ color: "#8A8574", letterSpacing: "0.12em" }}>
-            Portale personale
+        <div className="flex items-center justify-between px-5 py-4 md:pt-6 md:pb-5 md:block">
+          <div>
+            <div className="hidden md:block text-[10px] uppercase" style={{ color: "#8A8574", letterSpacing: "0.12em" }}>
+              Portale personale
+            </div>
+            <div className="text-base md:text-lg md:mt-0.5 font-semibold" style={{ color: "#FFFFFF" }}>
+              Libro Mastro
+            </div>
           </div>
-          <div className="text-lg mt-0.5 font-semibold" style={{ color: "#FFFFFF" }}>
-            Libro Mastro
-          </div>
+          <button
+            onClick={() => setMobileMenuOpen((o) => !o)}
+            className="md:hidden p-1.5 rounded-lg"
+            style={{ color: "#FFFFFF" }}
+            aria-label={mobileMenuOpen ? "Chiudi menu" : "Apri menu"}
+          >
+            {mobileMenuOpen ? <X size={20} /> : <Menu size={20} />}
+          </button>
         </div>
-        <nav className="p-2.5 md:p-2.5 flex md:flex-col gap-1 overflow-x-auto md:overflow-visible w-full">
-          <NavItem icon={LayoutDashboard} label="Bilancio" active={view === "dashboard"} onClick={() => setView("dashboard")} />
-          <NavItem icon={UploadCloud} label="Importa estratto" active={view === "import"} onClick={() => setView("import")} />
-          <NavItem icon={Tags} label="Categorie e budget" active={view === "rules"} onClick={() => setView("rules")} />
-          <NavItem icon={Landmark} label="Conti" active={view === "accounts"} onClick={() => setView("accounts")} />
+        <nav className={`${mobileMenuOpen ? "flex" : "hidden"} md:flex flex-col gap-1 p-2.5 w-full`}>
+          <NavItem icon={LayoutDashboard} label="Bilancio" active={view === "dashboard"} onClick={() => goTo("dashboard")} />
+          <NavItem icon={UploadCloud} label="Importa estratto" active={view === "import"} onClick={() => goTo("import")} />
+          <NavItem icon={Tags} label="Categorie e budget" active={view === "rules"} onClick={() => goTo("rules")} />
+          <NavItem icon={Landmark} label="Conti" active={view === "accounts"} onClick={() => goTo("accounts")} />
+          <NavItem icon={ArrowLeftRight} label="Confronto mesi" active={view === "compare"} onClick={() => goTo("compare")} />
         </nav>
       </div>
 
@@ -475,6 +504,9 @@ export default function FinanceTracker() {
             transactions={transactions}
             onChangeConfig={(next) => persistConfig(next)}
           />
+        )}
+        {view === "compare" && (
+          <CompareMonthsView transactions={transactions} months={months} config={config} />
         )}
       </div>
     </div>
@@ -683,7 +715,13 @@ function Dashboard({
                     {t.description.trim().charAt(0).toUpperCase() || "?"}
                   </div>
                   <div className="min-w-0 flex-1">
-                    <div className="text-sm truncate" title={t.description}>{t.description}</div>
+                    <div
+                      className="text-sm truncate"
+                      title={t.description}
+                      style={t.status === "cancellato" ? { textDecoration: "line-through", color: MUTED } : {}}
+                    >
+                      {t.description}
+                    </div>
                     <div className="text-xs" style={{ color: MUTED }}>
                       {formatDate(new Date(t.date))} · {t.account}
                     </div>
@@ -696,6 +734,24 @@ function Dashboard({
                   >
                     {config.categories.map((c) => (
                       <option key={c}>{c}</option>
+                    ))}
+                  </select>
+                  <select
+                    value={t.status || ""}
+                    onChange={(e) => onUpdateTransaction({ ...t, status: e.target.value })}
+                    title="Stato"
+                    className="text-xs rounded-lg outline-none shrink-0"
+                    style={{
+                      border: `1px solid ${LINE}`,
+                      padding: "3px 6px",
+                      color: t.status === "cancellato" ? RED : t.status === "da_valutare" ? GOLD : MUTED,
+                      background: t.status === "cancellato" ? RED_SOFT : t.status === "da_valutare" ? "#F7EEDD" : "transparent",
+                    }}
+                  >
+                    {STATUS_OPTIONS.map((s) => (
+                      <option key={s.value} value={s.value}>
+                        {s.label}
+                      </option>
                     ))}
                   </select>
                   <div
@@ -835,6 +891,7 @@ function ImportView({ config, onImport }) {
         account: acc,
         amount,
         category,
+        status: "",
       });
     }
     rows.forEach((r) => (r.id = txId(r)));
@@ -1231,5 +1288,165 @@ function AccountsView({ config, transactions, onChangeConfig }) {
         </button>
       </div>
     </Card>
+  );
+}
+
+// ---------------------------------------------------------------------------
+// Confronto mesi
+// ---------------------------------------------------------------------------
+
+function computeMonthStats(transactions, month) {
+  const tx = transactions.filter((t) => t.month === month);
+  let entrate = 0,
+    uscite = 0;
+  const byCategory = {};
+  for (const t of tx) {
+    if (t.amount >= 0) {
+      entrate += t.amount;
+    } else {
+      uscite += -t.amount;
+      if (t.category !== "Stipendio") {
+        byCategory[t.category] = (byCategory[t.category] || 0) + -t.amount;
+      }
+    }
+  }
+  return { entrate, uscite, saldo: entrate - uscite, byCategory, count: tx.length };
+}
+
+function DeltaBadge({ value, invert }) {
+  if (!value) {
+    return <span style={{ color: MUTED }}>—</span>;
+  }
+  const positive = invert ? value < 0 : value > 0;
+  return (
+    <span
+      className="px-2 py-0.5 rounded-full text-xs font-medium inline-flex items-center gap-0.5"
+      style={{
+        fontVariantNumeric: "tabular-nums",
+        color: positive ? GREEN : RED,
+        background: positive ? GREEN_SOFT : RED_SOFT,
+      }}
+    >
+      {value > 0 ? <ArrowUpRight size={11} /> : <ArrowDownRight size={11} />}
+      {formatCurrency(Math.abs(value))}
+    </span>
+  );
+}
+
+function CompareMonthsView({ transactions, months, config }) {
+  const [monthA, setMonthA] = useState(months[1] || months[0] || "");
+  const [monthB, setMonthB] = useState(months[0] || "");
+
+  if (months.length < 2) {
+    return (
+      <Card className="p-10 max-w-md">
+        <div className="text-2xl mb-2 font-semibold">Non c'è ancora abbastanza storico</div>
+        <p style={{ color: MUTED, fontSize: "14.5px", lineHeight: 1.6 }}>
+          Il confronto serve almeno due mesi con movimenti importati. Carica un altro estratto da "Importa estratto"
+          per iniziare a confrontare.
+        </p>
+      </Card>
+    );
+  }
+
+  const statsA = computeMonthStats(transactions, monthA || months[1]);
+  const statsB = computeMonthStats(transactions, monthB || months[0]);
+
+  const categories = Array.from(
+    new Set([...Object.keys(statsA.byCategory), ...Object.keys(statsB.byCategory)])
+  ).sort((a, b) => (statsB.byCategory[b] || 0) + (statsA.byCategory[b] || 0) - ((statsB.byCategory[a] || 0) + (statsA.byCategory[a] || 0)));
+
+  return (
+    <div>
+      <div className="flex flex-wrap items-end justify-between gap-4 mb-5">
+        <div className="text-2xl font-semibold">Confronto mesi</div>
+        <div className="flex items-center gap-2 text-sm">
+          <select
+            value={monthA}
+            onChange={(e) => setMonthA(e.target.value)}
+            className="px-3 py-1.5 rounded-xl"
+            style={{ border: `1px solid ${LINE}`, color: INK, background: CARD, boxShadow: SHADOW }}
+          >
+            {months.map((m) => (
+              <option key={m} value={m}>
+                {formatMonthLabel(m)}
+              </option>
+            ))}
+          </select>
+          <ArrowLeftRight size={14} style={{ color: MUTED }} />
+          <select
+            value={monthB}
+            onChange={(e) => setMonthB(e.target.value)}
+            className="px-3 py-1.5 rounded-xl"
+            style={{ border: `1px solid ${LINE}`, color: INK, background: CARD, boxShadow: SHADOW }}
+          >
+            {months.map((m) => (
+              <option key={m} value={m}>
+                {formatMonthLabel(m)}
+              </option>
+            ))}
+          </select>
+        </div>
+      </div>
+
+      <div className="grid grid-cols-1 sm:grid-cols-3 gap-4">
+        <Card className="px-5 py-4">
+          <div className="text-xs font-medium" style={{ color: MUTED }}>Saldo netto</div>
+          <div className="mt-1.5 flex items-baseline gap-2 flex-wrap">
+            <span className="text-lg font-semibold" style={{ fontVariantNumeric: "tabular-nums" }}>{formatCurrency(statsB.saldo)}</span>
+            <span className="text-xs" style={{ color: MUTED }}>vs {formatCurrency(statsA.saldo)}</span>
+          </div>
+          <div className="mt-1"><DeltaBadge value={statsB.saldo - statsA.saldo} /></div>
+        </Card>
+        <Card className="px-5 py-4">
+          <div className="text-xs font-medium" style={{ color: MUTED }}>Entrate</div>
+          <div className="mt-1.5 flex items-baseline gap-2 flex-wrap">
+            <span className="text-lg font-semibold" style={{ fontVariantNumeric: "tabular-nums" }}>{formatCurrency(statsB.entrate)}</span>
+            <span className="text-xs" style={{ color: MUTED }}>vs {formatCurrency(statsA.entrate)}</span>
+          </div>
+          <div className="mt-1"><DeltaBadge value={statsB.entrate - statsA.entrate} /></div>
+        </Card>
+        <Card className="px-5 py-4">
+          <div className="text-xs font-medium" style={{ color: MUTED }}>Uscite</div>
+          <div className="mt-1.5 flex items-baseline gap-2 flex-wrap">
+            <span className="text-lg font-semibold" style={{ fontVariantNumeric: "tabular-nums" }}>{formatCurrency(statsB.uscite)}</span>
+            <span className="text-xs" style={{ color: MUTED }}>vs {formatCurrency(statsA.uscite)}</span>
+          </div>
+          <div className="mt-1"><DeltaBadge value={statsB.uscite - statsA.uscite} invert /></div>
+        </Card>
+      </div>
+
+      <Card className="mt-4 p-5">
+        <div className="text-sm font-medium mb-3">Spesa per categoria</div>
+        {categories.length === 0 ? (
+          <div className="text-sm" style={{ color: MUTED }}>Nessuna spesa categorizzata in questi due mesi.</div>
+        ) : (
+          <table className="w-full text-sm" style={{ borderCollapse: "collapse" }}>
+            <thead>
+              <tr style={{ borderBottom: `1px solid ${LINE}`, color: MUTED, textAlign: "left" }}>
+                <th className="py-2 font-medium">Categoria</th>
+                <th className="py-2 font-medium text-right">{formatMonthLabel(monthA)}</th>
+                <th className="py-2 font-medium text-right">{formatMonthLabel(monthB)}</th>
+                <th className="py-2 font-medium text-right">Differenza</th>
+              </tr>
+            </thead>
+            <tbody>
+              {categories.map((c) => {
+                const a = statsA.byCategory[c] || 0;
+                const b = statsB.byCategory[c] || 0;
+                return (
+                  <tr key={c} style={{ borderBottom: `1px solid ${LINE}` }}>
+                    <td className="py-2">{c}</td>
+                    <td className="py-2 text-right" style={{ fontVariantNumeric: "tabular-nums", color: MUTED }}>{formatCurrency(a)}</td>
+                    <td className="py-2 text-right" style={{ fontVariantNumeric: "tabular-nums" }}>{formatCurrency(b)}</td>
+                    <td className="py-2 text-right"><DeltaBadge value={b - a} invert /></td>
+                  </tr>
+                );
+              })}
+            </tbody>
+          </table>
+        )}
+      </Card>
+    </div>
   );
 }
