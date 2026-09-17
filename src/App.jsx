@@ -13,6 +13,8 @@ import {
   PieChart,
   Pie,
   Legend,
+  ComposedChart,
+  Line,
 } from "recharts";
 import {
   LayoutDashboard,
@@ -166,6 +168,12 @@ function formatMonthLabel(key) {
   const d = new Date(Date.UTC(+y, +m - 1, 1));
   const label = d.toLocaleDateString("it-IT", { month: "long", year: "numeric", timeZone: "UTC" });
   return label.charAt(0).toUpperCase() + label.slice(1);
+}
+
+function formatMonthShort(key) {
+  const [y, m] = key.split("-");
+  const d = new Date(Date.UTC(+y, +m - 1, 1));
+  return d.toLocaleDateString("it-IT", { month: "short", timeZone: "UTC" }).replace(".", "");
 }
 
 function formatCurrency(n) {
@@ -398,6 +406,8 @@ export default function FinanceTracker() {
   const [config, setConfig] = useState(DEFAULT_CONFIG);
   const [view, setView] = useState("dashboard");
   const [selectedMonth, setSelectedMonth] = useState(null);
+  const [viewMode, setViewMode] = useState("mese"); // mese | anno
+  const [selectedYear, setSelectedYear] = useState(null);
   const [accountFilter, setAccountFilter] = useState("Tutti");
   const [saveError, setSaveError] = useState("");
 
@@ -463,40 +473,80 @@ export default function FinanceTracker() {
     if (!selectedMonth && months.length) setSelectedMonth(months[0]);
   }, [months, selectedMonth]);
 
-  const monthTx = useMemo(() => {
+  const years = useMemo(() => {
+    const s = new Set(months.map((m) => m.slice(0, 4)));
+    return Array.from(s).sort().reverse();
+  }, [months]);
+
+  useEffect(() => {
+    if (!selectedYear && years.length) setSelectedYear(years[0]);
+  }, [years, selectedYear]);
+
+  const periodTx = useMemo(() => {
+    if (viewMode === "anno") {
+      return transactions.filter(
+        (t) => t.month.slice(0, 4) === selectedYear && (accountFilter === "Tutti" || t.account === accountFilter)
+      );
+    }
     return transactions.filter(
       (t) => t.month === selectedMonth && (accountFilter === "Tutti" || t.account === accountFilter)
     );
-  }, [transactions, selectedMonth, accountFilter]);
+  }, [transactions, selectedMonth, selectedYear, viewMode, accountFilter]);
+
+  const monthTx = periodTx; // nome storico usato altrove nel componente
 
   const totals = useMemo(() => {
     let entrate = 0,
       uscite = 0;
-    for (const t of monthTx) {
+    for (const t of periodTx) {
       if (t.amount >= 0) entrate += t.amount;
       else uscite += -t.amount;
     }
     return { entrate, uscite, saldo: entrate - uscite };
-  }, [monthTx]);
+  }, [periodTx]);
 
   const byCategory = useMemo(() => {
     const map = {};
-    for (const t of monthTx) {
+    for (const t of periodTx) {
       if (t.amount < 0) {
         map[t.category] = (map[t.category] || 0) + -t.amount;
       }
     }
+    const monthsInPeriod =
+      viewMode === "anno"
+        ? new Set(periodTx.map((t) => t.month)).size || 1
+        : 1;
     const cats = new Set([...config.categories, ...Object.keys(map)]);
     return Array.from(cats)
       .filter((c) => c !== "Stipendio")
       .map((c) => {
         const speso = map[c] || 0;
-        const budget = config.budgets[c] || 0;
+        const budget = (config.budgets[c] || 0) * monthsInPeriod;
         return { category: c, speso, budget, scostamento: budget - speso };
       })
       .filter((r) => r.speso > 0 || r.budget > 0)
       .sort((a, b) => b.speso - a.speso);
-  }, [monthTx, config]);
+  }, [periodTx, config, viewMode]);
+
+  // Andamento mensile: serie storica di entrate/uscite/saldo per ogni mese,
+  // usata dal grafico di confronto tra mesi (sia in vista Mese che Anno).
+  const monthlySeries = useMemo(() => {
+    const relevantTx = accountFilter === "Tutti" ? transactions : transactions.filter((t) => t.account === accountFilter);
+    if (viewMode === "anno" && selectedYear) {
+      return Array.from({ length: 12 }, (_, i) => {
+        const m = `${selectedYear}-${String(i + 1).padStart(2, "0")}`;
+        const t = totalsOf(relevantTx.filter((tx) => tx.month === m));
+        return { month: m, label: formatMonthShort(m), Entrate: Math.round(t.entrate), Uscite: Math.round(t.uscite), Saldo: Math.round(t.saldo) };
+      });
+    }
+    const ascMonths = months.slice().reverse();
+    const idx = ascMonths.indexOf(selectedMonth);
+    const windowMonths = idx >= 0 ? ascMonths.slice(Math.max(0, idx - 5), idx + 1) : ascMonths.slice(-6);
+    return windowMonths.map((m) => {
+      const t = totalsOf(relevantTx.filter((tx) => tx.month === m));
+      return { month: m, label: formatMonthShort(m), Entrate: Math.round(t.entrate), Uscite: Math.round(t.uscite), Saldo: Math.round(t.saldo) };
+    });
+  }, [transactions, months, selectedMonth, selectedYear, viewMode, accountFilter]);
 
   if (loading) {
     return (
@@ -529,7 +579,7 @@ export default function FinanceTracker() {
             Portale personale
           </div>
           <div className="text-lg mt-0.5 font-semibold" style={{ color: "#FFFFFF" }}>
-            Libro Mastro
+            Expense Tracker
           </div>
         </div>
         <nav className="p-2.5 md:p-2.5 flex md:flex-col gap-1 overflow-x-auto md:overflow-visible w-full">
@@ -552,8 +602,14 @@ export default function FinanceTracker() {
             transactions={transactions}
             monthTx={monthTx}
             months={months}
+            years={years}
             selectedMonth={selectedMonth}
             setSelectedMonth={setSelectedMonth}
+            selectedYear={selectedYear}
+            setSelectedYear={setSelectedYear}
+            viewMode={viewMode}
+            setViewMode={setViewMode}
+            monthlySeries={monthlySeries}
             accountFilter={accountFilter}
             setAccountFilter={setAccountFilter}
             accounts={config.accounts}
@@ -614,8 +670,14 @@ function Dashboard({
   transactions,
   monthTx,
   months,
+  years,
   selectedMonth,
   setSelectedMonth,
+  selectedYear,
+  setSelectedYear,
+  viewMode,
+  setViewMode,
+  monthlySeries,
   accountFilter,
   setAccountFilter,
   accounts,
@@ -664,24 +726,58 @@ function Dashboard({
   const totalSpeso = pieData.reduce((s, d) => s + d.value, 0);
   const totalBudget = byCategory.reduce((s, r) => s + (r.budget || 0), 0);
   const tooltipStyle = { fontSize: 12, background: CARD, border: `1px solid ${LINE}`, color: INK, borderRadius: 8 };
+  const periodLabel = viewMode === "anno" ? selectedYear : formatMonthLabel(selectedMonth);
 
   return (
     <div>
       <div className="flex flex-wrap items-end justify-between gap-4 mb-5">
         <div>
           <div className="text-2xl font-semibold">Bilancio</div>
-          <select
-            value={selectedMonth || ""}
-            onChange={(e) => setSelectedMonth(e.target.value)}
-            className="mt-1 text-sm bg-transparent outline-none"
-            style={{ color: MUTED }}
-          >
-            {months.map((m) => (
-              <option key={m} value={m}>
-                {formatMonthLabel(m)}
-              </option>
-            ))}
-          </select>
+          <div className="flex items-center gap-2 mt-1.5">
+            <div className="flex rounded-lg overflow-hidden" style={{ border: `1px solid ${LINE}` }}>
+              <button
+                onClick={() => setViewMode("mese")}
+                className="px-2.5 py-1 text-xs font-medium"
+                style={{ background: viewMode === "mese" ? INK : "transparent", color: viewMode === "mese" ? CARD : MUTED }}
+              >
+                Mese
+              </button>
+              <button
+                onClick={() => setViewMode("anno")}
+                className="px-2.5 py-1 text-xs font-medium"
+                style={{ background: viewMode === "anno" ? INK : "transparent", color: viewMode === "anno" ? CARD : MUTED }}
+              >
+                Anno
+              </button>
+            </div>
+            {viewMode === "mese" ? (
+              <select
+                value={selectedMonth || ""}
+                onChange={(e) => setSelectedMonth(e.target.value)}
+                className="text-sm bg-transparent outline-none"
+                style={{ color: MUTED }}
+              >
+                {months.map((m) => (
+                  <option key={m} value={m}>
+                    {formatMonthLabel(m)}
+                  </option>
+                ))}
+              </select>
+            ) : (
+              <select
+                value={selectedYear || ""}
+                onChange={(e) => setSelectedYear(e.target.value)}
+                className="text-sm bg-transparent outline-none"
+                style={{ color: MUTED }}
+              >
+                {years.map((y) => (
+                  <option key={y} value={y}>
+                    {y}
+                  </option>
+                ))}
+              </select>
+            )}
+          </div>
         </div>
         <div className="flex items-center gap-2">
           <select
@@ -700,7 +796,7 @@ function Dashboard({
             className="text-sm px-3 py-1.5 rounded-xl flex items-center gap-1.5 font-medium"
             style={{ background: showAnalysis ? GOLD : CARD, color: showAnalysis ? "#fff" : INK, boxShadow: SHADOW }}
           >
-            <Sparkles size={14} /> Analizza il mese
+            <Sparkles size={14} /> Analizza
           </button>
           <button
             onClick={() => setShowManualForm((v) => !v)}
@@ -713,19 +809,9 @@ function Dashboard({
       </div>
 
       {showAnalysis && (
-        <Card className="p-5 mb-4">
-          <div className="text-sm font-medium mb-2 flex items-center gap-1.5">
-            <Sparkles size={14} style={{ color: GOLD }} /> Come è andato {formatMonthLabel(selectedMonth).toLowerCase()}
-          </div>
-          <ul className="space-y-1.5 text-sm" style={{ color: INK, lineHeight: 1.55 }}>
-            {analyzeMonth(transactions, selectedMonth, months, config).map((line, i) => (
-              <li key={i} className="flex gap-2">
-                <span style={{ color: GOLD }}>—</span>
-                <span>{line}</span>
-              </li>
-            ))}
-          </ul>
-        </Card>
+        <div className="mb-4">
+          <AiAnalysisPanel transactions={transactions} selectedMonth={selectedMonth} months={months} config={config} />
+        </div>
       )}
 
       {showManualForm && (
@@ -744,6 +830,26 @@ function Dashboard({
         <StatCard label="Entrate" value={formatCurrency(totals.entrate)} />
         <StatCard label="Uscite" value={formatCurrency(totals.uscite)} />
       </div>
+
+      {monthlySeries.length > 1 && (
+        <Card className="p-5 mt-4">
+          <div className="text-sm font-medium mb-3">
+            {viewMode === "anno" ? `Andamento mensile — ${selectedYear}` : "Andamento degli ultimi mesi"}
+          </div>
+          <ResponsiveContainer width="100%" height={200}>
+            <ComposedChart data={monthlySeries} margin={{ left: 4, right: 8, top: 4, bottom: 0 }}>
+              <CartesianGrid stroke={LINE} vertical={false} />
+              <XAxis dataKey="label" tick={{ fontSize: 11, fill: MUTED }} axisLine={{ stroke: LINE }} tickLine={false} />
+              <YAxis tick={{ fontSize: 11, fill: MUTED }} axisLine={{ stroke: LINE }} tickLine={false} width={44} />
+              <Tooltip formatter={(v) => formatCurrency(v)} contentStyle={tooltipStyle} labelStyle={{ color: INK }} itemStyle={{ color: INK }} cursor={{ fill: BG }} />
+              <Legend wrapperStyle={{ fontSize: 12 }} />
+              <Bar dataKey="Entrate" fill={GREEN} radius={[4, 4, 0, 0]} barSize={14} />
+              <Bar dataKey="Uscite" fill={RED} radius={[4, 4, 0, 0]} barSize={14} />
+              <Line type="monotone" dataKey="Saldo" stroke={GOLD} strokeWidth={2.5} dot={{ r: 3, fill: GOLD }} />
+            </ComposedChart>
+          </ResponsiveContainer>
+        </Card>
+      )}
 
       {(chartData.length > 0 || pieData.length > 0) && (
         <div className="mt-4 grid grid-cols-1 lg:grid-cols-5 gap-4">
@@ -816,7 +922,9 @@ function Dashboard({
       )}
 
       <Card className="mt-4 p-5">
-        <div className="text-sm font-medium mb-3">Scostamento dal budget</div>
+        <div className="text-sm font-medium mb-3">
+          Scostamento dal budget{viewMode === "anno" ? " (budget annuale stimato)" : ""}
+        </div>
         <table className="w-full text-sm" style={{ borderCollapse: "collapse" }}>
           <thead>
             <tr style={{ borderBottom: `1px solid ${LINE}`, color: MUTED, textAlign: "left" }}>
@@ -858,7 +966,9 @@ function Dashboard({
       </Card>
 
       <Card className="mt-4 p-5">
-        <div className="text-sm font-medium mb-3">Movimenti del mese ({monthTx.length})</div>
+        <div className="text-sm font-medium mb-3">
+          Movimenti {viewMode === "anno" ? `del ${selectedYear}` : "del mese"} ({monthTx.length})
+        </div>
         <div className="overflow-x-auto">
           <div className="divide-y" style={{ borderColor: LINE }}>
             {monthTx
@@ -1587,6 +1697,243 @@ function ManualEntryForm({ accounts, categories, onSave, onCancel }) {
           Salva movimento
         </button>
       </div>
+    </Card>
+  );
+}
+
+// ---------------------------------------------------------------------------
+// Analisi del mese con AI (Claude), con fallback automatico senza AI
+// ---------------------------------------------------------------------------
+
+const AI_KEY_STORAGE_KEY = "anthropic_api_key";
+const FIXED_CATEGORY_HINT =
+  "Mutuo, Casa, Bollette, Telefono, Assicurazioni, Risparmio, Ricarica conto";
+
+async function callClaude(apiKey, prompt) {
+  const res = await fetch("https://api.anthropic.com/v1/messages", {
+    method: "POST",
+    headers: {
+      "content-type": "application/json",
+      "x-api-key": apiKey,
+      "anthropic-version": "2023-06-01",
+      "anthropic-dangerous-direct-browser-access": "true",
+    },
+    body: JSON.stringify({
+      model: "claude-haiku-4-5-20251001",
+      max_tokens: 500,
+      messages: [{ role: "user", content: prompt }],
+    }),
+  });
+  if (!res.ok) {
+    let detail = "";
+    try {
+      const j = await res.json();
+      detail = j?.error?.message || "";
+    } catch (e) {
+      /* risposta non JSON */
+    }
+    if (res.status === 401) throw new Error("Chiave API non valida. Controllala e riprova.");
+    throw new Error(detail || `Errore dell'API (codice ${res.status}).`);
+  }
+  const data = await res.json();
+  return (data.content || [])
+    .filter((b) => b.type === "text")
+    .map((b) => b.text)
+    .join("\n")
+    .trim();
+}
+
+function buildAnalysisPrompt(transactions, selectedMonth, months, config) {
+  const idx = months.indexOf(selectedMonth);
+  const prevMonth = idx >= 0 && idx + 1 < months.length ? months[idx + 1] : null;
+
+  const curTx = transactions.filter((t) => t.month === selectedMonth);
+  const curByCat = spendByCategory(curTx);
+  const curTotals = totalsOf(curTx);
+
+  const curLines = Object.keys(curByCat)
+    .sort((a, b) => curByCat[b] - curByCat[a])
+    .map((c) => `${c}: speso ${curByCat[c].toFixed(0)}€${config.budgets[c] ? `, budget ${config.budgets[c]}€` : ""}`)
+    .join("\n");
+
+  let prevBlock = "Nessun mese precedente disponibile per il confronto.";
+  if (prevMonth) {
+    const prevTx = transactions.filter((t) => t.month === prevMonth);
+    const prevByCat = spendByCategory(prevTx);
+    const prevLines = Object.keys(prevByCat)
+      .sort((a, b) => prevByCat[b] - prevByCat[a])
+      .map((c) => `${c}: ${prevByCat[c].toFixed(0)}€`)
+      .join("\n");
+    prevBlock = `Mese precedente (${formatMonthLabel(prevMonth)}), uscite totali ${totalsOf(prevTx).uscite.toFixed(
+      0
+    )}€:\n${prevLines}`;
+  }
+
+  return `Sei un assistente che aiuta una persona a leggere le proprie spese personali su un portale che si è costruita da sola.
+
+Mese in esame: ${formatMonthLabel(selectedMonth)}. Entrate totali ${curTotals.entrate.toFixed(
+    0
+  )}€, uscite totali ${curTotals.uscite.toFixed(0)}€, saldo ${curTotals.saldo.toFixed(0)}€.
+
+Spesa per categoria questo mese:
+${curLines || "(nessuna spesa registrata)"}
+
+${prevBlock}
+
+Istruzioni:
+- Le seguenti categorie sono spese fisse, difficili o non sensate da ridurre nel breve periodo: ${FIXED_CATEGORY_HINT}. Non suggerire mai di tagliarle, a meno che l'importo di questo mese non sia chiaramente anomalo rispetto al solito (es. raddoppiato senza motivo).
+- Concentra i consigli di risparmio solo su categorie discrezionali (es. Ristoranti, Shopping, Svago, Vino, Abbonamenti, Trasporti, Spesa se sopra la media).
+- Scrivi in italiano, tono diretto e amichevole, come se parlassi direttamente con la persona. Niente markdown, niente elenchi puntati: 4-5 frasi scorrevoli.
+- Includi: un giudizio complessivo sul mese rispetto al precedente, e un consiglio pratico e specifico su una o due categorie discrezionali su cui vale la pena agire (se ce ne sono).`;
+}
+
+function AiAnalysisPanel({ transactions, selectedMonth, months, config }) {
+  const [apiKey, setApiKey] = useState(undefined); // undefined = ancora in caricamento
+  const [keyInput, setKeyInput] = useState("");
+  const [mode, setMode] = useState("ai"); // ai | offline
+  const [loading, setLoading] = useState(false);
+  const [result, setResult] = useState("");
+  const [error, setError] = useState("");
+
+  useEffect(() => {
+    (async () => {
+      try {
+        const r = await window.storage.get(AI_KEY_STORAGE_KEY, false);
+        setApiKey(r && r.value ? r.value : null);
+      } catch (e) {
+        setApiKey(null);
+      }
+    })();
+  }, []);
+
+  const runAnalysis = async (key) => {
+    setLoading(true);
+    setError("");
+    setResult("");
+    try {
+      const prompt = buildAnalysisPrompt(transactions, selectedMonth, months, config);
+      const text = await callClaude(key, prompt);
+      setResult(text);
+    } catch (e) {
+      setError(e.message || "Analisi non riuscita.");
+    } finally {
+      setLoading(false);
+    }
+  };
+
+  useEffect(() => {
+    if (apiKey && mode === "ai") runAnalysis(apiKey);
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [apiKey, selectedMonth]);
+
+  const saveKey = async () => {
+    const k = keyInput.trim();
+    if (!k) return;
+    try {
+      await window.storage.set(AI_KEY_STORAGE_KEY, k, false);
+    } catch (e) {
+      /* se il salvataggio fallisce, la chiave resta comunque in memoria per questa sessione */
+    }
+    setApiKey(k);
+  };
+
+  const forgetKey = async () => {
+    try {
+      await window.storage.delete(AI_KEY_STORAGE_KEY, false);
+    } catch (e) {
+      /* ignorabile */
+    }
+    setApiKey(null);
+    setResult("");
+  };
+
+  const offlineLines = mode === "offline" ? analyzeMonth(transactions, selectedMonth, months, config) : [];
+
+  return (
+    <Card className="p-5">
+      <div className="flex items-center justify-between mb-2">
+        <div className="text-sm font-medium flex items-center gap-1.5">
+          <Sparkles size={14} style={{ color: GOLD }} /> Come è andato {formatMonthLabel(selectedMonth).toLowerCase()}
+        </div>
+        {apiKey && (
+          <button onClick={forgetKey} className="text-xs" style={{ color: MUTED }}>
+            Rimuovi chiave salvata
+          </button>
+        )}
+      </div>
+
+      {apiKey === undefined && <div className="text-sm" style={{ color: MUTED }}>Caricamento…</div>}
+
+      {apiKey === null && mode === "ai" && (
+        <div>
+          <p className="text-sm mb-3" style={{ color: MUTED, lineHeight: 1.5 }}>
+            Per un'analisi vera (che capisce quali spese sono fisse e quali no) serve una tua chiave API Anthropic —
+            gratuita da creare, il costo di queste analisi è di pochi centesimi. La chiave resta salvata solo nel tuo
+            account, privata.
+          </p>
+          <div className="flex gap-2 flex-wrap mb-2">
+            <input
+              type="password"
+              value={keyInput}
+              onChange={(e) => setKeyInput(e.target.value)}
+              placeholder="sk-ant-…"
+              className="px-2 py-1.5 text-sm rounded-lg flex-1 min-w-[200px]"
+              style={{ border: `1px solid ${LINE}` }}
+            />
+            <button onClick={saveKey} className="px-3 py-1.5 text-sm rounded-lg text-white font-medium" style={{ background: TEAL }}>
+              Salva e analizza
+            </button>
+          </div>
+          <div className="text-xs" style={{ color: MUTED }}>
+            La crei su{" "}
+            <a href="https://console.anthropic.com/settings/keys" target="_blank" rel="noreferrer" style={{ color: TEAL }}>
+              console.anthropic.com/settings/keys
+            </a>
+            . In alternativa,{" "}
+            <button onClick={() => setMode("offline")} style={{ color: TEAL, textDecoration: "underline" }}>
+              usa l'analisi automatica senza AI
+            </button>
+            .
+          </div>
+        </div>
+      )}
+
+      {apiKey && mode === "ai" && (
+        <div>
+          {loading && <div className="text-sm" style={{ color: MUTED }}>Sto leggendo i tuoi movimenti…</div>}
+          {error && (
+            <div className="mb-3 px-3 py-2 text-sm flex items-center gap-2 rounded-xl" style={{ background: ERROR_BG, color: RED }}>
+              <AlertCircle size={14} /> {error}
+            </div>
+          )}
+          {!loading && result && (
+            <p className="text-sm" style={{ color: INK, lineHeight: 1.6, whiteSpace: "pre-line" }}>
+              {result}
+            </p>
+          )}
+          {!loading && (
+            <button onClick={() => runAnalysis(apiKey)} className="mt-3 text-xs" style={{ color: MUTED }}>
+              Rigenera analisi
+            </button>
+          )}
+        </div>
+      )}
+
+      {mode === "offline" && (
+        <div>
+          <ul className="space-y-1.5 text-sm mb-2" style={{ color: INK, lineHeight: 1.55 }}>
+            {offlineLines.map((line, i) => (
+              <li key={i} className="flex gap-2">
+                <span style={{ color: GOLD }}>—</span>
+                <span>{line}</span>
+              </li>
+            ))}
+          </ul>
+          <button onClick={() => setMode("ai")} className="text-xs" style={{ color: TEAL }}>
+            Prova invece l'analisi con AI
+          </button>
+        </div>
+      )}
     </Card>
   );
 }
