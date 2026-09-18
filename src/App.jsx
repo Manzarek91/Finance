@@ -31,7 +31,8 @@ import {
   AlertCircle,
   ArrowUpRight,
   ArrowDownRight,
-  Sparkles,
+  Lightbulb,
+  Flag,
 } from "lucide-react";
 
 // ---------------------------------------------------------------------------
@@ -215,105 +216,158 @@ function totalsOf(txs) {
   return { entrate, uscite, saldo: entrate - uscite };
 }
 
-// Analisi testuale del mese: confronta il mese selezionato con quello
-// precedente e con la media dei 3 mesi prima, individuando le categorie
-// cresciute di più e quelle fuori budget. Nessuna chiamata esterna:
-// è un'analisi calcolata sui tuoi dati, direttamente nel browser.
-function analyzeMonth(transactions, selectedMonth, months, config) {
-  const idx = months.indexOf(selectedMonth);
-  const prevMonth = idx >= 0 && idx + 1 < months.length ? months[idx + 1] : null;
-  const priorMonths = months.slice(idx + 1, idx + 4); // fino a 3 mesi precedenti
+function computeStats(values) {
+  const n = values.length;
+  if (!n) return { mean: 0, stdev: 0 };
+  const mean = values.reduce((a, b) => a + b, 0) / n;
+  const variance = values.reduce((a, b) => a + (b - mean) ** 2, 0) / n;
+  return { mean, stdev: Math.sqrt(variance) };
+}
 
-  const curTx = transactions.filter((t) => t.month === selectedMonth);
-  const curTotals = totalsOf(curTx);
-  const curByCat = spendByCategory(curTx);
+const FIXED_CATEGORIES = ["Mutuo", "Casa", "Bollette", "Telefono", "Assicurazioni", "Risparmio", "Ricarica conto"];
 
-  const lines = [];
+// Genera gli insights su tutti i mesi disponibili: nessuna chiamata esterna,
+// solo calcoli sui tuoi dati, direttamente nel browser. Ispirato ai riquadri
+// colorati della "KJ Finance Dashboard".
+function generateInsights(transactions, months, config) {
+  const monthsAsc = months.slice().reverse();
+  const first = monthsAsc[0];
+  const last = monthsAsc[monthsAsc.length - 1];
+  const sameYear = first.slice(0, 4) === last.slice(0, 4);
+  const rangeLabel = sameYear
+    ? `${formatMonthShort(first)} – ${formatMonthShort(last)} ${last.slice(0, 4)} · Personale`
+    : `${formatMonthLabel(first)} – ${formatMonthLabel(last)} · Personale`;
 
-  if (!prevMonth) {
-    lines.push(
-      `Questo è il primo mese con dati: ${formatCurrency(curTotals.uscite)} di uscite e ${formatCurrency(
-        curTotals.entrate
-      )} di entrate. Da qui in poi potrò confrontarlo con i mesi successivi.`
-    );
-  } else {
-    const prevTx = transactions.filter((t) => t.month === prevMonth);
-    const prevTotals = totalsOf(prevTx);
-    const prevByCat = spendByCategory(prevTx);
+  const monthTotals = monthsAsc.map((m) => ({ month: m, ...totalsOf(transactions.filter((t) => t.month === m)) }));
+  const nettoTotale = monthTotals.reduce((s, m) => s + m.saldo, 0);
+  const entrateTotali = monthTotals.reduce((s, m) => s + m.entrate, 0);
+  const avgNetto = nettoTotale / monthsAsc.length;
+  const saveRate = entrateTotali > 0 ? (nettoTotale / entrateTotali) * 100 : 0;
 
-    const deltaUscite = curTotals.uscite - prevTotals.uscite;
-    const deltaLabel = formatMonthLabel(prevMonth);
-    if (Math.abs(deltaUscite) < 1) {
-      lines.push(`Hai speso circa come a ${deltaLabel}: ${formatCurrency(curTotals.uscite)} di uscite totali.`);
-    } else if (deltaUscite > 0) {
-      lines.push(
-        `Hai speso ${formatCurrency(deltaUscite)} in più rispetto a ${deltaLabel} (${formatCurrency(
-          curTotals.uscite
-        )} contro ${formatCurrency(prevTotals.uscite)}).`
-      );
-    } else {
-      lines.push(
-        `Hai speso ${formatCurrency(-deltaUscite)} in meno rispetto a ${deltaLabel} (${formatCurrency(
-          curTotals.uscite
-        )} contro ${formatCurrency(prevTotals.uscite)}) — ottimo.`
-      );
-    }
+  const allByCat = spendByCategory(transactions);
+  const nonFixedCats = Object.keys(allByCat).filter((c) => !FIXED_CATEGORIES.includes(c) && c !== "Stipendio");
+  const topNonFixed = nonFixedCats.sort((a, b) => allByCat[b] - allByCat[a])[0];
 
-    // media dei mesi precedenti (esclusi quello corrente), per categoria
-    const priorTx = transactions.filter((t) => priorMonths.includes(t.month));
-    const priorCount = priorMonths.filter((m) => transactions.some((t) => t.month === m)).length || 1;
-    const priorByCat = spendByCategory(priorTx);
-    const avgPriorByCat = {};
-    Object.keys(priorByCat).forEach((c) => (avgPriorByCat[c] = priorByCat[c] / priorCount));
+  // anomalie: mese/categoria molto sopra la propria media storica
+  const catsAll = Array.from(new Set(transactions.filter((t) => t.amount < 0).map((t) => t.category))).filter(
+    (c) => !FIXED_CATEGORIES.includes(c)
+  );
+  const anomalies = [];
+  monthsAsc.forEach((m) => {
+    const curByCat = spendByCategory(transactions.filter((t) => t.month === m));
+    catsAll.forEach((c) => {
+      const cur = curByCat[c] || 0;
+      if (cur < 15) return;
+      const otherVals = monthsAsc
+        .filter((mm) => mm !== m)
+        .map((mm) => spendByCategory(transactions.filter((t) => t.month === mm))[c] || 0)
+        .filter((v) => v > 0);
+      if (!otherVals.length) return;
+      const avg = otherVals.reduce((a, b) => a + b, 0) / otherVals.length;
+      if (avg > 0 && cur >= avg * 1.3) {
+        anomalies.push({ category: c, month: m, cur, avg, pct: Math.round(((cur - avg) / avg) * 100) });
+      }
+    });
+  });
+  anomalies.sort((a, b) => b.cur - b.avg - (a.cur - a.avg));
+  const topAnomalies = anomalies.slice(0, 4);
 
-    const cats = new Set([...Object.keys(curByCat), ...Object.keys(avgPriorByCat)]);
-    const increases = Array.from(cats)
-      .filter((c) => c !== "Stipendio")
-      .map((c) => {
-        const cur = curByCat[c] || 0;
-        const avg = avgPriorByCat[c] || 0;
-        return { category: c, cur, avg, delta: cur - avg };
-      })
-      .filter((r) => r.cur >= 15 && r.delta > 10)
-      .sort((a, b) => b.delta - a.delta)
-      .slice(0, 3);
+  const flaggedTx = transactions.filter((t) => t.flagged && t.amount < 0);
+  const flaggedTotal = flaggedTx.reduce((s, t) => s + -t.amount, 0);
 
-    if (increases.length) {
-      const parts = increases.map(
-        (r) =>
-          `${r.category} (${formatCurrency(r.cur)}${
-            r.avg > 0 ? `, contro una media di ${formatCurrency(r.avg)}` : ", categoria nuova o quasi"
-          })`
-      );
-      lines.push(`Le categorie cresciute di più rispetto alla media dei mesi precedenti sono: ${parts.join("; ")}.`);
-    }
+  // categorie con spesa stabile mese su mese (basso coefficiente di variazione)
+  const allCatsForTrend = Array.from(new Set(transactions.filter((t) => t.amount < 0).map((t) => t.category)));
+  const trendCandidates = allCatsForTrend
+    .map((c) => {
+      const vals = monthsAsc.map((m) => spendByCategory(transactions.filter((t) => t.month === m))[c] || 0);
+      const present = vals.filter((v) => v > 0);
+      if (present.length < 3) return null;
+      const { mean, stdev } = computeStats(vals);
+      if (mean < 15) return null;
+      const cv = stdev / mean;
+      return { category: c, mean, cv };
+    })
+    .filter(Boolean)
+    .filter((r) => r.cv < 0.22)
+    .sort((a, b) => b.mean - a.mean)
+    .slice(0, 2);
 
-    const overBudget = Object.keys(config.budgets)
-      .map((c) => ({ category: c, budget: config.budgets[c] || 0, speso: curByCat[c] || 0 }))
-      .filter((r) => r.budget > 0 && r.speso > r.budget)
-      .sort((a, b) => b.speso - b.budget - (a.speso - a.budget))
-      .slice(0, 3);
+  const bestMonth = monthTotals.reduce((a, b) => (b.saldo > a.saldo ? b : a), monthTotals[0]);
+  const worstMonth = monthTotals.reduce((a, b) => (b.saldo < a.saldo ? b : a), monthTotals[0]);
 
-    if (overBudget.length) {
-      const parts = overBudget.map(
-        (r) => `${r.category} di ${formatCurrency(r.speso - r.budget)} oltre il budget previsto`
-      );
-      lines.push(`Sei andato fuori budget su: ${parts.join("; ")}.`);
-    }
+  const sections = [
+    {
+      title: `Quadro generale — ${monthsAsc.length} mes${monthsAsc.length === 1 ? "e" : "i"}`,
+      items: [
+        {
+          text: `Hai messo da parte ${formatCurrency(nettoTotale)} netti in ${monthsAsc.length} mesi. Media di ${formatCurrency(
+            avgNetto
+          )}/mese.`,
+          tone: "info",
+        },
+        {
+          text: `Il tuo tasso di risparmio reale è del ${saveRate.toFixed(0)}%.`,
+          tone: saveRate >= 0 ? "positive" : "warning",
+        },
+      ],
+    },
+  ];
 
-    const suggestion = increases[0] || overBudget[0];
-    if (suggestion) {
-      const catName = suggestion.category;
-      lines.push(
-        `Se cerchi dove tagliare, ${catName} è il punto da cui partire il prossimo mese — è la voce che ha pesato di più sull'aumento della spesa.`
-      );
-    } else if (deltaUscite <= 0) {
-      lines.push("Nessuna categoria fuori controllo questo mese: la spesa è sotto controllo su tutta la linea.");
-    }
+  const bigLinesItems = [];
+  if (topNonFixed) {
+    bigLinesItems.push({
+      text: `Spesa principale non fissa: ${topNonFixed} — ${formatCurrency(allByCat[topNonFixed])} in totale.`,
+      tone: "info",
+    });
+  }
+  topAnomalies.forEach((a) => {
+    bigLinesItems.push({
+      text: `${a.category} a ${formatMonthLabel(a.month)} ha toccato ${formatCurrency(
+        a.cur
+      )} — circa il ${a.pct}% sopra la tua media (${formatCurrency(a.avg)}).`,
+      tone: "warning",
+    });
+  });
+  bigLinesItems.push({
+    text:
+      flaggedTx.length > 0
+        ? `Movimenti segnalati da valutare: ${formatCurrency(flaggedTotal)} (${flaggedTx.length}). Rivedili dalla lista movimenti.`
+        : `Nessun movimento ancora segnalato come "da valutare" — puoi contrassegnare un abbonamento o una spesa ricorrente dalla lista movimenti nella Dashboard con l'icona della bandierina.`,
+    tone: "actionable",
+  });
+  sections.push({ title: "Abbonamenti e voci principali", items: bigLinesItems });
+
+  if (trendCandidates.length) {
+    sections.push({
+      title: "Tendenze da tenere d'occhio",
+      items: trendCandidates.map((r) => ({
+        text: `${r.category} è una spesa stabile — circa ${formatCurrency(r.mean)}/mese in media. Buona base su cui pianificare.`,
+        tone: "positive",
+      })),
+    });
   }
 
-  return lines;
+  sections.push({
+    title: "Mesi migliori e peggiori",
+    items: [
+      { text: `Totale netto su ${monthsAsc.length} mesi: ${formatCurrency(nettoTotale)}.`, tone: "info" },
+      {
+        text: `${formatMonthLabel(bestMonth.month)} è stato il tuo mese migliore: ${
+          bestMonth.saldo >= 0 ? "+" : ""
+        }${formatCurrency(bestMonth.saldo)} netti.`,
+        tone: "positive",
+      },
+      {
+        text: `${formatMonthLabel(worstMonth.month)} è stato il mese più stretto: ${formatCurrency(worstMonth.saldo)} netti.`,
+        tone: worstMonth.saldo < 0 ? "warning" : "info",
+      },
+    ],
+  });
+
+  return { rangeLabel, sections };
 }
+
+
 
 // ---------------------------------------------------------------------------
 // UI di base
@@ -331,6 +385,11 @@ const RED = "#C2513F";
 const RED_SOFT = "#F6E5E1";
 const TEAL = "#3FA79E";
 const GOLD = "#C6924A";
+const GOLD_SOFT = "#F5ECDA";
+const BLUE = "#3B6EA5";
+const BLUE_SOFT = "#E7EEF6";
+const ORANGE = "#B5732E";
+const ORANGE_SOFT = "#F5E9DA";
 const MUTED = "#8B8676";
 const ERROR_BG = "#F6E5E1";
 const SHADOW = "0 1px 2px rgba(28,27,24,0.04), 0 6px 16px rgba(28,27,24,0.05)";
@@ -392,6 +451,57 @@ function StatCard({ label, value, dark }) {
       >
         {value}
       </div>
+    </Card>
+  );
+}
+
+function InsightRow({ text, tone }) {
+  const map = {
+    info: { bg: BLUE_SOFT, border: BLUE, color: "#26364A" },
+    positive: { bg: GREEN_SOFT, border: GREEN, color: "#1F4A38" },
+    warning: { bg: ORANGE_SOFT, border: ORANGE, color: "#5C3B15" },
+    actionable: { bg: GOLD_SOFT, border: GOLD, color: "#5C4A1E" },
+  };
+  const s = map[tone] || map.info;
+  return (
+    <div
+      className="px-3.5 py-2.5 rounded-lg text-sm mb-2"
+      style={{ background: s.bg, borderLeft: `3px solid ${s.border}`, color: s.color, lineHeight: 1.5 }}
+    >
+      {text}
+    </div>
+  );
+}
+
+function InsightsView({ transactions, months, config }) {
+  if (!months.length) {
+    return (
+      <Card className="p-10 max-w-md">
+        <div className="text-2xl mb-2 font-semibold">Ancora nessun dato</div>
+        <p style={{ color: MUTED, fontSize: "14.5px", lineHeight: 1.6 }}>
+          Importa un estratto conto o aggiungi qualche movimento a mano: qui troverai le analisi calcolate
+          automaticamente sulle tue spese, senza bisogno di alcun servizio esterno.
+        </p>
+      </Card>
+    );
+  }
+  const { rangeLabel, sections } = generateInsights(transactions, months, config);
+  return (
+    <Card className="p-6 md:p-8">
+      <div className="text-2xl font-semibold mb-0.5">Insights</div>
+      <div className="text-sm mb-6" style={{ color: MUTED }}>
+        {rangeLabel}
+      </div>
+      {sections.map((sec) => (
+        <div key={sec.title} className="mb-6 last:mb-0">
+          <div className="text-xs uppercase mb-2" style={{ color: MUTED, letterSpacing: "0.08em" }}>
+            {sec.title}
+          </div>
+          {sec.items.map((it, i) => (
+            <InsightRow key={i} text={it.text} tone={it.tone} />
+          ))}
+        </div>
+      ))}
     </Card>
   );
 }
@@ -587,6 +697,7 @@ export default function FinanceTracker() {
           <NavItem icon={UploadCloud} label="Importa estratto" active={view === "import"} onClick={() => setView("import")} />
           <NavItem icon={Tags} label="Categorie e budget" active={view === "rules"} onClick={() => setView("rules")} />
           <NavItem icon={Landmark} label="Conti" active={view === "accounts"} onClick={() => setView("accounts")} />
+          <NavItem icon={Lightbulb} label="Insights" active={view === "insights"} onClick={() => setView("insights")} />
         </nav>
       </div>
 
@@ -657,6 +768,9 @@ export default function FinanceTracker() {
             onChangeConfig={(next) => persistConfig(next)}
           />
         )}
+        {view === "insights" && (
+          <InsightsView transactions={transactions} months={months} config={config} />
+        )}
       </div>
     </div>
   );
@@ -689,7 +803,6 @@ function Dashboard({
   onAddTransaction,
 }) {
   const [showManualForm, setShowManualForm] = useState(false);
-  const [showAnalysis, setShowAnalysis] = useState(false);
 
   const saveManual = (tx, accountUsed) => {
     onAddTransaction(tx, accountUsed);
@@ -791,13 +904,6 @@ function Dashboard({
             ))}
           </select>
           <button
-            onClick={() => setShowAnalysis((v) => !v)}
-            className="text-sm px-3 py-1.5 rounded-xl flex items-center gap-1.5 font-medium"
-            style={{ background: showAnalysis ? GOLD : CARD, color: showAnalysis ? "#fff" : INK, boxShadow: SHADOW }}
-          >
-            <Sparkles size={14} /> Analizza
-          </button>
-          <button
             onClick={() => setShowManualForm((v) => !v)}
             className="text-sm px-3 py-1.5 rounded-xl flex items-center gap-1.5 font-medium text-white"
             style={{ background: TEAL, boxShadow: SHADOW }}
@@ -806,12 +912,6 @@ function Dashboard({
           </button>
         </div>
       </div>
-
-      {showAnalysis && (
-        <div className="mb-4">
-          <AiAnalysisPanel transactions={transactions} selectedMonth={selectedMonth} months={months} config={config} />
-        </div>
-      )}
 
       {showManualForm && (
         <div className="mb-4">
@@ -1004,6 +1104,14 @@ function Dashboard({
                     {t.amount >= 0 ? "+" : ""}
                     {formatCurrency(t.amount)}
                   </div>
+                  <button
+                    onClick={() => onUpdateTransaction({ ...t, flagged: !t.flagged })}
+                    style={{ color: t.flagged ? GOLD : LINE }}
+                    title={t.flagged ? "Segnalato: togli la bandierina" : "Segna come abbonamento/spesa da valutare"}
+                    className="shrink-0"
+                  >
+                    <Flag size={14} fill={t.flagged ? GOLD : "none"} />
+                  </button>
                   <button onClick={() => onDeleteTransaction(t.id)} style={{ color: MUTED }} title="Elimina" className="shrink-0">
                     <Trash2 size={13} />
                   </button>
@@ -1700,239 +1808,3 @@ function ManualEntryForm({ accounts, categories, onSave, onCancel }) {
   );
 }
 
-// ---------------------------------------------------------------------------
-// Analisi del mese con AI (Claude), con fallback automatico senza AI
-// ---------------------------------------------------------------------------
-
-const AI_KEY_STORAGE_KEY = "anthropic_api_key";
-const FIXED_CATEGORY_HINT =
-  "Mutuo, Casa, Bollette, Telefono, Assicurazioni, Risparmio, Ricarica conto";
-
-async function callClaude(apiKey, prompt) {
-  const res = await fetch("https://api.anthropic.com/v1/messages", {
-    method: "POST",
-    headers: {
-      "content-type": "application/json",
-      "x-api-key": apiKey,
-      "anthropic-version": "2023-06-01",
-      "anthropic-dangerous-direct-browser-access": "true",
-    },
-    body: JSON.stringify({
-      model: "claude-haiku-4-5-20251001",
-      max_tokens: 500,
-      messages: [{ role: "user", content: prompt }],
-    }),
-  });
-  if (!res.ok) {
-    let detail = "";
-    try {
-      const j = await res.json();
-      detail = j?.error?.message || "";
-    } catch (e) {
-      /* risposta non JSON */
-    }
-    if (res.status === 401) throw new Error("Chiave API non valida. Controllala e riprova.");
-    throw new Error(detail || `Errore dell'API (codice ${res.status}).`);
-  }
-  const data = await res.json();
-  return (data.content || [])
-    .filter((b) => b.type === "text")
-    .map((b) => b.text)
-    .join("\n")
-    .trim();
-}
-
-function buildAnalysisPrompt(transactions, selectedMonth, months, config) {
-  const idx = months.indexOf(selectedMonth);
-  const prevMonth = idx >= 0 && idx + 1 < months.length ? months[idx + 1] : null;
-
-  const curTx = transactions.filter((t) => t.month === selectedMonth);
-  const curByCat = spendByCategory(curTx);
-  const curTotals = totalsOf(curTx);
-
-  const curLines = Object.keys(curByCat)
-    .sort((a, b) => curByCat[b] - curByCat[a])
-    .map((c) => `${c}: speso ${curByCat[c].toFixed(0)}€${config.budgets[c] ? `, budget ${config.budgets[c]}€` : ""}`)
-    .join("\n");
-
-  let prevBlock = "Nessun mese precedente disponibile per il confronto.";
-  if (prevMonth) {
-    const prevTx = transactions.filter((t) => t.month === prevMonth);
-    const prevByCat = spendByCategory(prevTx);
-    const prevLines = Object.keys(prevByCat)
-      .sort((a, b) => prevByCat[b] - prevByCat[a])
-      .map((c) => `${c}: ${prevByCat[c].toFixed(0)}€`)
-      .join("\n");
-    prevBlock = `Mese precedente (${formatMonthLabel(prevMonth)}), uscite totali ${totalsOf(prevTx).uscite.toFixed(
-      0
-    )}€:\n${prevLines}`;
-  }
-
-  return `Sei un assistente che aiuta una persona a leggere le proprie spese personali su un portale che si è costruita da sola.
-
-Mese in esame: ${formatMonthLabel(selectedMonth)}. Entrate totali ${curTotals.entrate.toFixed(
-    0
-  )}€, uscite totali ${curTotals.uscite.toFixed(0)}€, saldo ${curTotals.saldo.toFixed(0)}€.
-
-Spesa per categoria questo mese:
-${curLines || "(nessuna spesa registrata)"}
-
-${prevBlock}
-
-Istruzioni:
-- Le seguenti categorie sono spese fisse, difficili o non sensate da ridurre nel breve periodo: ${FIXED_CATEGORY_HINT}. Non suggerire mai di tagliarle, a meno che l'importo di questo mese non sia chiaramente anomalo rispetto al solito (es. raddoppiato senza motivo).
-- Concentra i consigli di risparmio solo su categorie discrezionali (es. Ristoranti, Shopping, Svago, Vino, Abbonamenti, Trasporti, Spesa se sopra la media).
-- Scrivi in italiano, tono diretto e amichevole, come se parlassi direttamente con la persona. Niente markdown, niente elenchi puntati: 4-5 frasi scorrevoli.
-- Includi: un giudizio complessivo sul mese rispetto al precedente, e un consiglio pratico e specifico su una o due categorie discrezionali su cui vale la pena agire (se ce ne sono).`;
-}
-
-function AiAnalysisPanel({ transactions, selectedMonth, months, config }) {
-  const [apiKey, setApiKey] = useState(undefined); // undefined = ancora in caricamento
-  const [keyInput, setKeyInput] = useState("");
-  const [mode, setMode] = useState("ai"); // ai | offline
-  const [loading, setLoading] = useState(false);
-  const [result, setResult] = useState("");
-  const [error, setError] = useState("");
-
-  useEffect(() => {
-    (async () => {
-      try {
-        const r = await window.storage.get(AI_KEY_STORAGE_KEY, false);
-        setApiKey(r && r.value ? r.value : null);
-      } catch (e) {
-        setApiKey(null);
-      }
-    })();
-  }, []);
-
-  const runAnalysis = async (key) => {
-    setLoading(true);
-    setError("");
-    setResult("");
-    try {
-      const prompt = buildAnalysisPrompt(transactions, selectedMonth, months, config);
-      const text = await callClaude(key, prompt);
-      setResult(text);
-    } catch (e) {
-      setError(e.message || "Analisi non riuscita.");
-    } finally {
-      setLoading(false);
-    }
-  };
-
-  useEffect(() => {
-    if (apiKey && mode === "ai") runAnalysis(apiKey);
-    // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [apiKey, selectedMonth]);
-
-  const saveKey = async () => {
-    const k = keyInput.trim();
-    if (!k) return;
-    try {
-      await window.storage.set(AI_KEY_STORAGE_KEY, k, false);
-    } catch (e) {
-      /* se il salvataggio fallisce, la chiave resta comunque in memoria per questa sessione */
-    }
-    setApiKey(k);
-  };
-
-  const forgetKey = async () => {
-    try {
-      await window.storage.delete(AI_KEY_STORAGE_KEY, false);
-    } catch (e) {
-      /* ignorabile */
-    }
-    setApiKey(null);
-    setResult("");
-  };
-
-  const offlineLines = mode === "offline" ? analyzeMonth(transactions, selectedMonth, months, config) : [];
-
-  return (
-    <Card className="p-5">
-      <div className="flex items-center justify-between mb-2">
-        <div className="text-sm font-medium flex items-center gap-1.5">
-          <Sparkles size={14} style={{ color: GOLD }} /> Come è andato {formatMonthLabel(selectedMonth).toLowerCase()}
-        </div>
-        {apiKey && (
-          <button onClick={forgetKey} className="text-xs" style={{ color: MUTED }}>
-            Rimuovi chiave salvata
-          </button>
-        )}
-      </div>
-
-      {apiKey === undefined && <div className="text-sm" style={{ color: MUTED }}>Caricamento…</div>}
-
-      {apiKey === null && mode === "ai" && (
-        <div>
-          <p className="text-sm mb-3" style={{ color: MUTED, lineHeight: 1.5 }}>
-            Per un'analisi vera (che capisce quali spese sono fisse e quali no) serve una tua chiave API Anthropic —
-            gratuita da creare, il costo di queste analisi è di pochi centesimi. La chiave resta salvata solo nel tuo
-            account, privata.
-          </p>
-          <div className="flex gap-2 flex-wrap mb-2">
-            <input
-              type="password"
-              value={keyInput}
-              onChange={(e) => setKeyInput(e.target.value)}
-              placeholder="sk-ant-…"
-              className="px-2 py-1.5 text-sm rounded-lg flex-1 min-w-[200px]"
-              style={{ border: `1px solid ${LINE}` }}
-            />
-            <button onClick={saveKey} className="px-3 py-1.5 text-sm rounded-lg text-white font-medium" style={{ background: TEAL }}>
-              Salva e analizza
-            </button>
-          </div>
-          <div className="text-xs" style={{ color: MUTED }}>
-            La crei su{" "}
-            <a href="https://console.anthropic.com/settings/keys" target="_blank" rel="noreferrer" style={{ color: TEAL }}>
-              console.anthropic.com/settings/keys
-            </a>
-            . In alternativa,{" "}
-            <button onClick={() => setMode("offline")} style={{ color: TEAL, textDecoration: "underline" }}>
-              usa l'analisi automatica senza AI
-            </button>
-            .
-          </div>
-        </div>
-      )}
-
-      {apiKey && mode === "ai" && (
-        <div>
-          {loading && <div className="text-sm" style={{ color: MUTED }}>Sto leggendo i tuoi movimenti…</div>}
-          {error && (
-            <div className="mb-3 px-3 py-2 text-sm flex items-center gap-2 rounded-xl" style={{ background: ERROR_BG, color: RED }}>
-              <AlertCircle size={14} /> {error}
-            </div>
-          )}
-          {!loading && result && (
-            <p className="text-sm" style={{ color: INK, lineHeight: 1.6, whiteSpace: "pre-line" }}>
-              {result}
-            </p>
-          )}
-          {!loading && (
-            <button onClick={() => runAnalysis(apiKey)} className="mt-3 text-xs" style={{ color: MUTED }}>
-              Rigenera analisi
-            </button>
-          )}
-        </div>
-      )}
-
-      {mode === "offline" && (
-        <div>
-          <ul className="space-y-1.5 text-sm mb-2" style={{ color: INK, lineHeight: 1.55 }}>
-            {offlineLines.map((line, i) => (
-              <li key={i} className="flex gap-2">
-                <span style={{ color: GOLD }}>—</span>
-                <span>{line}</span>
-              </li>
-            ))}
-          </ul>
-          <button onClick={() => setMode("ai")} className="text-xs" style={{ color: TEAL }}>
-            Prova invece l'analisi con AI
-          </button>
-        </div>
-      )}
-    </Card>
-  );
-}
