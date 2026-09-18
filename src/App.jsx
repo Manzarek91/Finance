@@ -726,7 +726,6 @@ function Dashboard({
   const totalSpeso = pieData.reduce((s, d) => s + d.value, 0);
   const totalBudget = byCategory.reduce((s, r) => s + (r.budget || 0), 0);
   const tooltipStyle = { fontSize: 12, background: CARD, border: `1px solid ${LINE}`, color: INK, borderRadius: 8 };
-  const periodLabel = viewMode === "anno" ? selectedYear : formatMonthLabel(selectedMonth);
 
   return (
     <div>
