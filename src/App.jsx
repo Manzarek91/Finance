@@ -1,6 +1,7 @@
-import React, { useState, useEffect, useMemo, useCallback } from "react";
+import React, { useState, useEffect, useMemo, useCallback, useRef } from "react";
 import Papa from "papaparse";
 import * as XLSX from "xlsx";
+import { createClient } from "@supabase/supabase-js";
 import {
   BarChart,
   Bar,
@@ -39,8 +40,33 @@ import {
 // Costanti e helper
 // ---------------------------------------------------------------------------
 
-const TX_KEY = "finance-transactions";
-const CFG_KEY = "finance-config";
+// Supabase è l'unica source of truth. Non usare alcuna persistenza del browser
+// nemmeno come fallback: così i dati locali non possono sovrascrivere il DB.
+const SUPABASE_URL = import.meta.env.VITE_SUPABASE_URL;
+const SUPABASE_ANON_KEY = import.meta.env.VITE_SUPABASE_ANON_KEY;
+const CONFIGURED_DATA_TABLE = import.meta.env.VITE_SUPABASE_DATA_TABLE;
+const CONFIGURED_USER_COLUMN = import.meta.env.VITE_SUPABASE_USER_COLUMN;
+
+const supabase =
+  SUPABASE_URL && SUPABASE_ANON_KEY
+    ? createClient(SUPABASE_URL, SUPABASE_ANON_KEY, {
+        auth: { persistSession: true, autoRefreshToken: true, detectSessionInUrl: true },
+      })
+    : null;
+
+// La struttura attesa è una riga per utente con due colonne JSONB:
+//   transactions jsonb, config jsonb
+// Se VITE_SUPABASE_DATA_TABLE non è impostata, il caricamento cerca in sola
+// lettura i due nomi storicamente più comuni e poi continua a usare la fonte
+// trovata. Impostando le due variabili VITE_* la fonte diventa esplicita.
+const DATA_SOURCES = CONFIGURED_DATA_TABLE
+  ? [{ table: CONFIGURED_DATA_TABLE, userColumn: CONFIGURED_USER_COLUMN || "user_id" }]
+  : [
+      { table: "finance_data", userColumn: "user_id" },
+      { table: "finance_data", userColumn: "id" },
+      { table: "user_data", userColumn: "user_id" },
+      { table: "user_data", userColumn: "id" },
+    ];
 
 const DEFAULT_CATEGORIES = [
   "Stipendio",
@@ -113,6 +139,99 @@ const DEFAULT_CONFIG = {
   budgets: {},
   accounts: [],
 };
+
+function normalizeConfig(saved) {
+  if (!saved || typeof saved !== "object" || Array.isArray(saved)) return DEFAULT_CONFIG;
+  return {
+    ...DEFAULT_CONFIG,
+    ...saved,
+    categories: Array.from(new Set([...(saved.categories || []), ...DEFAULT_CATEGORIES])),
+    rules: Array.isArray(saved.rules) ? saved.rules : DEFAULT_RULES,
+    budgets: saved.budgets && typeof saved.budgets === "object" ? saved.budgets : {},
+    accounts: Array.isArray(saved.accounts) ? saved.accounts : [],
+  };
+}
+
+function normalizeFinanceRow(row) {
+  return {
+    transactions: Array.isArray(row?.transactions) ? row.transactions : [],
+    config: normalizeConfig(row?.config),
+  };
+}
+
+function isMissingSourceError(error) {
+  return ["42P01", "42703", "PGRST200", "PGRST204", "PGRST205"].includes(error?.code);
+}
+
+async function loadFinanceRow(userId) {
+  if (!supabase) {
+    throw new Error("Configurazione Supabase mancante: imposta VITE_SUPABASE_URL e VITE_SUPABASE_ANON_KEY.");
+  }
+
+  let firstAvailableSource = null;
+  const sourceErrors = [];
+
+  for (const source of DATA_SOURCES) {
+    const { data, error } = await supabase
+      .from(source.table)
+      .select("transactions, config")
+      .eq(source.userColumn, userId)
+      .maybeSingle();
+
+    if (!error) {
+      firstAvailableSource ||= source;
+      if (data) return { source, row: normalizeFinanceRow(data) };
+      continue;
+    }
+
+    sourceErrors.push(`${source.table}.${source.userColumn}: ${error.message}`);
+    if (!isMissingSourceError(error)) throw error;
+  }
+
+  if (firstAvailableSource) {
+    return { source: firstAvailableSource, row: normalizeFinanceRow(null) };
+  }
+
+  throw new Error(
+    `Tabella dati Supabase non trovata. Configura VITE_SUPABASE_DATA_TABLE e VITE_SUPABASE_USER_COLUMN. ${sourceErrors.join(" | ")}`
+  );
+}
+
+async function saveFinanceRow(source, userId, changes, currentData) {
+  const updatePayload = {};
+  if (Object.prototype.hasOwnProperty.call(changes, "transactions")) {
+    updatePayload.transactions = changes.transactions;
+  }
+  if (Object.prototype.hasOwnProperty.call(changes, "config")) {
+    updatePayload.config = changes.config;
+  }
+
+  const { data: updated, error: updateError } = await supabase
+    .from(source.table)
+    .update(updatePayload)
+    .eq(source.userColumn, userId)
+    .select("transactions, config")
+    .maybeSingle();
+
+  if (updateError) throw updateError;
+  if (updated) return normalizeFinanceRow(updated);
+
+  // Crea la riga solo quando per l'utente non esiste ancora. Non importa e
+  // non fonde mai dati provenienti dal browser.
+  const insertPayload = {
+    [source.userColumn]: userId,
+    transactions: changes.transactions ?? currentData.transactions,
+    config: changes.config ?? currentData.config,
+  };
+  const { data: inserted, error: insertError } = await supabase
+    .from(source.table)
+    .insert(insertPayload)
+    .select("transactions, config")
+    .single();
+
+  if (insertError) throw insertError;
+  return normalizeFinanceRow(inserted);
+}
 
 function parseAmount(raw) {
   if (raw === null || raw === undefined) return NaN;
@@ -520,58 +639,110 @@ export default function FinanceTracker() {
   const [selectedYear, setSelectedYear] = useState(null);
   const [accountFilter, setAccountFilter] = useState("Tutti");
   const [saveError, setSaveError] = useState("");
+  const userIdRef = useRef(null);
+  const dataSourceRef = useRef(null);
 
-  // ---- caricamento iniziale --------------------------------------------
-  useEffect(() => {
-    (async () => {
+  const applyFinanceRow = useCallback((row) => {
+    setTransactions(row.transactions);
+    setConfig(row.config);
+  }, []);
+
+  const loadFromSupabase = useCallback(
+    async (userId) => {
+      setLoading(true);
+      setSaveError("");
       try {
-        let tx = [];
-        let cfg = DEFAULT_CONFIG;
-        try {
-          const r = await window.storage.get(TX_KEY, false);
-          if (r && r.value) tx = JSON.parse(r.value);
-        } catch (e) {
-          /* nessuna transazione salvata ancora */
-        }
-        try {
-          const r = await window.storage.get(CFG_KEY, false);
-          if (r && r.value) {
-            const saved = JSON.parse(r.value);
-            const mergedCategories = Array.from(new Set([...(saved.categories || []), ...DEFAULT_CATEGORIES]));
-            cfg = { ...DEFAULT_CONFIG, ...saved, categories: mergedCategories };
-          }
-        } catch (e) {
-          /* nessuna config salvata ancora, uso default */
-        }
-        setTransactions(tx);
-        setConfig(cfg);
+        const { source, row } = await loadFinanceRow(userId);
+        userIdRef.current = userId;
+        dataSourceRef.current = source;
+        applyFinanceRow(row);
+      } catch (error) {
+        setTransactions([]);
+        setConfig(DEFAULT_CONFIG);
+        setSaveError(`Caricamento da Supabase non riuscito: ${error.message}`);
       } finally {
         setLoading(false);
       }
-    })();
-  }, []);
+    },
+    [applyFinanceRow]
+  );
 
-  const persistTransactions = useCallback(async (next) => {
-    setTransactions(next);
-    try {
-      const res = await window.storage.set(TX_KEY, JSON.stringify(next), false);
-      if (!res) setSaveError("Salvataggio non riuscito. Riprova.");
-      else setSaveError("");
-    } catch (e) {
-      setSaveError("Salvataggio non riuscito. Riprova.");
-    }
-  }, []);
+  // ---- sessione e caricamento iniziale: esclusivamente da Supabase -----
+  useEffect(() => {
+    let active = true;
 
-  const persistConfig = useCallback(async (next) => {
-    setConfig(next);
+    const initialize = async () => {
+      if (!supabase) {
+        if (active) {
+          setSaveError("Configurazione Supabase mancante: imposta VITE_SUPABASE_URL e VITE_SUPABASE_ANON_KEY.");
+          setLoading(false);
+        }
+        return;
+      }
+
+      const { data, error } = await supabase.auth.getSession();
+      if (!active) return;
+      if (error) {
+        setSaveError(`Impossibile verificare la sessione Supabase: ${error.message}`);
+        setLoading(false);
+        return;
+      }
+      if (data.session?.user) {
+        await loadFromSupabase(data.session.user.id);
+      } else {
+        userIdRef.current = null;
+        dataSourceRef.current = null;
+        setTransactions([]);
+        setConfig(DEFAULT_CONFIG);
+        setSaveError("Accedi per caricare i dati salvati su Supabase.");
+        setLoading(false);
+      }
+    };
+
+    initialize();
+    const {
+      data: { subscription },
+    } = supabase?.auth.onAuthStateChange((_event, session) => {
+      if (!active) return;
+      if (session?.user) {
+        void loadFromSupabase(session.user.id);
+      } else {
+        userIdRef.current = null;
+        dataSourceRef.current = null;
+        setTransactions([]);
+        setConfig(DEFAULT_CONFIG);
+        setSaveError("Accedi per caricare i dati salvati su Supabase.");
+        setLoading(false);
+      }
+    }) || { data: { subscription: null } };
+
+    return () => {
+      active = false;
+      subscription?.unsubscribe();
+    };
+  }, [loadFromSupabase]);
+
+  const persistData = useCallback(async (changes) => {
+    setSaveError("");
     try {
-      const res = await window.storage.set(CFG_KEY, JSON.stringify(next), false);
-      if (!res) setSaveError("Salvataggio non riuscito. Riprova.");
-      else setSaveError("");
-    } catch (e) {
-      setSaveError("Salvataggio non riuscito. Riprova.");
+      const userId = userIdRef.current;
+      if (!userId) throw new Error("sessione utente non disponibile");
+
+      let source = dataSourceRef.current;
+      if (!source) {
+        const loaded = await loadFinanceRow(userId);
+        source = loaded.source;
+        dataSourceRef.current = source;
+      }
+
+      const saved = await saveFinanceRow(source, userId, changes, { transactions, config });
+      applyFinanceRow(saved);
+      return true;
+    } catch (error) {
+      setSaveError(`Salvataggio su Supabase non riuscito: ${error.message}`);
+      return false;
     }
-  }, []);
+  }, [transactions, config, applyFinanceRow]);
 
   // ---- dati derivati -------------------------------------------------
   const months = useMemo(() => {
@@ -729,16 +900,16 @@ export default function FinanceTracker() {
             config={config}
             onUpdateTransaction={(updated) => {
               const next = transactions.map((t) => (t.id === updated.id ? updated : t));
-              persistTransactions(next);
+              persistData({ transactions: next });
             }}
             onDeleteTransaction={(id) => {
-              persistTransactions(transactions.filter((t) => t.id !== id));
+              persistData({ transactions: transactions.filter((t) => t.id !== id) });
             }}
             onAddTransaction={(tx, accountUsed) => {
-              persistTransactions([...transactions, tx]);
-              if (accountUsed && !config.accounts.includes(accountUsed)) {
-                persistConfig({ ...config, accounts: [...config.accounts, accountUsed] });
-              }
+              const changes = { transactions: [...transactions, tx] };
+              if (accountUsed && !config.accounts.includes(accountUsed))
+                changes.config = { ...config, accounts: [...config.accounts, accountUsed] };
+              persistData(changes);
             }}
           />
         )}
@@ -748,10 +919,10 @@ export default function FinanceTracker() {
             onImport={(newTx, accountUsed) => {
               const existingIds = new Set(transactions.map((t) => t.id));
               const toAdd = newTx.filter((t) => !existingIds.has(t.id));
-              persistTransactions([...transactions, ...toAdd]);
-              if (accountUsed && !config.accounts.includes(accountUsed)) {
-                persistConfig({ ...config, accounts: [...config.accounts, accountUsed] });
-              }
+              const changes = { transactions: [...transactions, ...toAdd] };
+              if (accountUsed && !config.accounts.includes(accountUsed))
+                changes.config = { ...config, accounts: [...config.accounts, accountUsed] };
+              persistData(changes);
               setView("dashboard");
               const ms = Array.from(new Set(toAdd.map((t) => t.month))).sort().reverse();
               if (ms.length) setSelectedMonth(ms[0]);
@@ -759,13 +930,13 @@ export default function FinanceTracker() {
           />
         )}
         {view === "rules" && (
-          <RulesView config={config} onChange={(next) => persistConfig(next)} />
+          <RulesView config={config} onChange={(next) => persistData({ config: next })} />
         )}
         {view === "accounts" && (
           <AccountsView
             config={config}
             transactions={transactions}
-            onChangeConfig={(next) => persistConfig(next)}
+            onChangeConfig={(next) => persistData({ config: next })}
           />
         )}
         {view === "insights" && (
