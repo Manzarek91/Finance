@@ -1,7 +1,7 @@
 import React, { useState, useEffect, useMemo, useCallback, useRef } from "react";
 import Papa from "papaparse";
 import * as XLSX from "xlsx";
-import { createClient } from "@supabase/supabase-js";
+import { supabase } from "./supabaseClient.js";
 import {
   BarChart,
   Bar,
@@ -40,33 +40,10 @@ import {
 // Costanti e helper
 // ---------------------------------------------------------------------------
 
-// Supabase è l'unica source of truth. Non usare alcuna persistenza del browser
-// nemmeno come fallback: così i dati locali non possono sovrascrivere il DB.
-const SUPABASE_URL = import.meta.env.VITE_SUPABASE_URL;
-const SUPABASE_ANON_KEY = import.meta.env.VITE_SUPABASE_ANON_KEY;
-const CONFIGURED_DATA_TABLE = import.meta.env.VITE_SUPABASE_DATA_TABLE;
-const CONFIGURED_USER_COLUMN = import.meta.env.VITE_SUPABASE_USER_COLUMN;
-
-const supabase =
-  SUPABASE_URL && SUPABASE_ANON_KEY
-    ? createClient(SUPABASE_URL, SUPABASE_ANON_KEY, {
-        auth: { persistSession: true, autoRefreshToken: true, detectSessionInUrl: true },
-      })
-    : null;
-
-// La struttura attesa è una riga per utente con due colonne JSONB:
-//   transactions jsonb, config jsonb
-// Se VITE_SUPABASE_DATA_TABLE non è impostata, il caricamento cerca in sola
-// lettura i due nomi storicamente più comuni e poi continua a usare la fonte
-// trovata. Impostando le due variabili VITE_* la fonte diventa esplicita.
-const DATA_SOURCES = CONFIGURED_DATA_TABLE
-  ? [{ table: CONFIGURED_DATA_TABLE, userColumn: CONFIGURED_USER_COLUMN || "user_id" }]
-  : [
-      { table: "finance_data", userColumn: "user_id" },
-      { table: "finance_data", userColumn: "id" },
-      { table: "user_data", userColumn: "user_id" },
-      { table: "user_data", userColumn: "id" },
-    ];
+const TX_KEY = "finance-transactions";
+const CFG_KEY = "finance-config";
+const KV_TABLE = "kv_store";
+const EXPECTED_SUPABASE_URL = "https://iuototmpdaplygreewqk.supabase.co";
 
 const DEFAULT_CATEGORIES = [
   "Stipendio",
@@ -140,97 +117,70 @@ const DEFAULT_CONFIG = {
   accounts: [],
 };
 
-function normalizeConfig(saved) {
+function assertSupabaseProject() {
+  const configuredUrl = String(import.meta.env.VITE_SUPABASE_URL || "").replace(/\/$/, "");
+  if (configuredUrl !== EXPECTED_SUPABASE_URL) {
+    throw new Error(
+      `VITE_SUPABASE_URL deve essere ${EXPECTED_SUPABASE_URL}. Nessun dato è stato letto o scritto.`
+    );
+  }
+}
+
+function parseStoredJson(value, key) {
+  if (value === null || value === undefined || value === "") return null;
+  if (typeof value !== "string") return value;
+  try {
+    return JSON.parse(value);
+  } catch {
+    throw new Error(`Il valore Supabase "${key}" non contiene JSON valido.`);
+  }
+}
+
+function normalizeStoredConfig(saved) {
   if (!saved || typeof saved !== "object" || Array.isArray(saved)) return DEFAULT_CONFIG;
+  const mergedCategories = Array.from(new Set([...(saved.categories || []), ...DEFAULT_CATEGORIES]));
+  return { ...DEFAULT_CONFIG, ...saved, categories: mergedCategories };
+}
+
+async function readFinanceData(userId) {
+  const { data, error } = await supabase
+    .from(KV_TABLE)
+    .select("key,value")
+    .eq("user_id", userId)
+    .in("key", [TX_KEY, CFG_KEY]);
+
+  if (error) throw new Error(`Errore di lettura da Supabase: ${error.message}`);
+
+  const byKey = new Map((data || []).map((row) => [row.key, row.value]));
+  const storedTransactions = parseStoredJson(byKey.get(TX_KEY), TX_KEY);
+  const storedConfig = parseStoredJson(byKey.get(CFG_KEY), CFG_KEY);
+
+  if (storedTransactions !== null && !Array.isArray(storedTransactions)) {
+    throw new Error(`Il valore Supabase "${TX_KEY}" non è un elenco di movimenti.`);
+  }
+
   return {
-    ...DEFAULT_CONFIG,
-    ...saved,
-    categories: Array.from(new Set([...(saved.categories || []), ...DEFAULT_CATEGORIES])),
-    rules: Array.isArray(saved.rules) ? saved.rules : DEFAULT_RULES,
-    budgets: saved.budgets && typeof saved.budgets === "object" ? saved.budgets : {},
-    accounts: Array.isArray(saved.accounts) ? saved.accounts : [],
+    transactions: storedTransactions || [],
+    config: normalizeStoredConfig(storedConfig),
   };
 }
 
-function normalizeFinanceRow(row) {
-  return {
-    transactions: Array.isArray(row?.transactions) ? row.transactions : [],
-    config: normalizeConfig(row?.config),
-  };
-}
+async function writeFinanceValue(userId, key, value) {
+  // Scrive solo in seguito a un'azione esplicita dell'utente. Il caricamento
+  // iniziale è esclusivamente in lettura e non crea né modifica righe.
+  const { error } = await supabase
+    .from(KV_TABLE)
+    .upsert(
+      {
+        user_id: userId,
+        key,
+        value: JSON.stringify(value),
+        updated_at: new Date().toISOString(),
+      },
+      { onConflict: "user_id,key" }
+    );
 
-function isMissingSourceError(error) {
-  return ["42P01", "42703", "PGRST200", "PGRST204", "PGRST205"].includes(error?.code);
-}
-
-async function loadFinanceRow(userId) {
-  if (!supabase) {
-    throw new Error("Configurazione Supabase mancante: imposta VITE_SUPABASE_URL e VITE_SUPABASE_ANON_KEY.");
-  }
-
-  let firstAvailableSource = null;
-  const sourceErrors = [];
-
-  for (const source of DATA_SOURCES) {
-    const { data, error } = await supabase
-      .from(source.table)
-      .select("transactions, config")
-      .eq(source.userColumn, userId)
-      .maybeSingle();
-
-    if (!error) {
-      firstAvailableSource ||= source;
-      if (data) return { source, row: normalizeFinanceRow(data) };
-      continue;
-    }
-
-    sourceErrors.push(`${source.table}.${source.userColumn}: ${error.message}`);
-    if (!isMissingSourceError(error)) throw error;
-  }
-
-  if (firstAvailableSource) {
-    return { source: firstAvailableSource, row: normalizeFinanceRow(null) };
-  }
-
-  throw new Error(
-    `Tabella dati Supabase non trovata. Configura VITE_SUPABASE_DATA_TABLE e VITE_SUPABASE_USER_COLUMN. ${sourceErrors.join(" | ")}`
-  );
-}
-
-async function saveFinanceRow(source, userId, changes, currentData) {
-  const updatePayload = {};
-  if (Object.prototype.hasOwnProperty.call(changes, "transactions")) {
-    updatePayload.transactions = changes.transactions;
-  }
-  if (Object.prototype.hasOwnProperty.call(changes, "config")) {
-    updatePayload.config = changes.config;
-  }
-
-  const { data: updated, error: updateError } = await supabase
-    .from(source.table)
-    .update(updatePayload)
-    .eq(source.userColumn, userId)
-    .select("transactions, config")
-    .maybeSingle();
-
-  if (updateError) throw updateError;
-  if (updated) return normalizeFinanceRow(updated);
-
-  // Crea la riga solo quando per l'utente non esiste ancora. Non importa e
-  // non fonde mai dati provenienti dal browser.
-  const insertPayload = {
-    [source.userColumn]: userId,
-    transactions: changes.transactions ?? currentData.transactions,
-    config: changes.config ?? currentData.config,
-  };
-  const { data: inserted, error: insertError } = await supabase
-    .from(source.table)
-    .insert(insertPayload)
-    .select("transactions, config")
-    .single();
-
-  if (insertError) throw insertError;
-  return normalizeFinanceRow(inserted);
+  if (error) throw new Error(`Errore di scrittura su Supabase: ${error.message}`);
 }
 
 function parseAmount(raw) {
@@ -640,109 +590,71 @@ export default function FinanceTracker() {
   const [accountFilter, setAccountFilter] = useState("Tutti");
   const [saveError, setSaveError] = useState("");
   const userIdRef = useRef(null);
-  const dataSourceRef = useRef(null);
+  const dbReadyRef = useRef(false);
 
-  const applyFinanceRow = useCallback((row) => {
-    setTransactions(row.transactions);
-    setConfig(row.config);
-  }, []);
+  // ---- caricamento iniziale: solo public.kv_store su Supabase ----------
+  useEffect(() => {
+    let active = true;
 
-  const loadFromSupabase = useCallback(
-    async (userId) => {
-      setLoading(true);
-      setSaveError("");
+    (async () => {
       try {
-        const { source, row } = await loadFinanceRow(userId);
-        userIdRef.current = userId;
-        dataSourceRef.current = source;
-        applyFinanceRow(row);
+        assertSupabaseProject();
+        const { data, error } = await supabase.auth.getUser();
+        if (error) throw new Error(`Impossibile verificare l'utente Supabase: ${error.message}`);
+        if (!data.user) throw new Error("Devi effettuare l'accesso per caricare i dati da Supabase.");
+
+        const financeData = await readFinanceData(data.user.id);
+        if (!active) return;
+
+        userIdRef.current = data.user.id;
+        dbReadyRef.current = true;
+        setTransactions(financeData.transactions);
+        setConfig(financeData.config);
+        setSaveError("");
       } catch (error) {
+        if (!active) return;
+        // In caso di errore non abilitiamo alcuna scrittura: in questo modo
+        // uno stato vuoto non può sovrascrivere i dati già presenti nel DB.
+        userIdRef.current = null;
+        dbReadyRef.current = false;
         setTransactions([]);
         setConfig(DEFAULT_CONFIG);
         setSaveError(`Caricamento da Supabase non riuscito: ${error.message}`);
       } finally {
-        setLoading(false);
+        if (active) setLoading(false);
       }
-    },
-    [applyFinanceRow]
-  );
-
-  // ---- sessione e caricamento iniziale: esclusivamente da Supabase -----
-  useEffect(() => {
-    let active = true;
-
-    const initialize = async () => {
-      if (!supabase) {
-        if (active) {
-          setSaveError("Configurazione Supabase mancante: imposta VITE_SUPABASE_URL e VITE_SUPABASE_ANON_KEY.");
-          setLoading(false);
-        }
-        return;
-      }
-
-      const { data, error } = await supabase.auth.getSession();
-      if (!active) return;
-      if (error) {
-        setSaveError(`Impossibile verificare la sessione Supabase: ${error.message}`);
-        setLoading(false);
-        return;
-      }
-      if (data.session?.user) {
-        await loadFromSupabase(data.session.user.id);
-      } else {
-        userIdRef.current = null;
-        dataSourceRef.current = null;
-        setTransactions([]);
-        setConfig(DEFAULT_CONFIG);
-        setSaveError("Accedi per caricare i dati salvati su Supabase.");
-        setLoading(false);
-      }
-    };
-
-    initialize();
-    const {
-      data: { subscription },
-    } = supabase?.auth.onAuthStateChange((_event, session) => {
-      if (!active) return;
-      if (session?.user) {
-        void loadFromSupabase(session.user.id);
-      } else {
-        userIdRef.current = null;
-        dataSourceRef.current = null;
-        setTransactions([]);
-        setConfig(DEFAULT_CONFIG);
-        setSaveError("Accedi per caricare i dati salvati su Supabase.");
-        setLoading(false);
-      }
-    }) || { data: { subscription: null } };
+    })();
 
     return () => {
       active = false;
-      subscription?.unsubscribe();
     };
-  }, [loadFromSupabase]);
+  }, []);
 
-  const persistData = useCallback(async (changes) => {
-    setSaveError("");
+  const persistTransactions = useCallback(async (next) => {
     try {
-      const userId = userIdRef.current;
-      if (!userId) throw new Error("sessione utente non disponibile");
-
-      let source = dataSourceRef.current;
-      if (!source) {
-        const loaded = await loadFinanceRow(userId);
-        source = loaded.source;
-        dataSourceRef.current = source;
+      if (!dbReadyRef.current || !userIdRef.current) {
+        throw new Error("dati Supabase non caricati; scrittura bloccata per sicurezza");
       }
-
-      const saved = await saveFinanceRow(source, userId, changes, { transactions, config });
-      applyFinanceRow(saved);
-      return true;
+      await writeFinanceValue(userIdRef.current, TX_KEY, next);
+      setTransactions(next);
+      setSaveError("");
     } catch (error) {
       setSaveError(`Salvataggio su Supabase non riuscito: ${error.message}`);
-      return false;
     }
-  }, [transactions, config, applyFinanceRow]);
+  }, []);
+
+  const persistConfig = useCallback(async (next) => {
+    try {
+      if (!dbReadyRef.current || !userIdRef.current) {
+        throw new Error("dati Supabase non caricati; scrittura bloccata per sicurezza");
+      }
+      await writeFinanceValue(userIdRef.current, CFG_KEY, next);
+      setConfig(next);
+      setSaveError("");
+    } catch (error) {
+      setSaveError(`Salvataggio su Supabase non riuscito: ${error.message}`);
+    }
+  }, []);
 
   // ---- dati derivati -------------------------------------------------
   const months = useMemo(() => {
@@ -900,16 +812,16 @@ export default function FinanceTracker() {
             config={config}
             onUpdateTransaction={(updated) => {
               const next = transactions.map((t) => (t.id === updated.id ? updated : t));
-              persistData({ transactions: next });
+              persistTransactions(next);
             }}
             onDeleteTransaction={(id) => {
-              persistData({ transactions: transactions.filter((t) => t.id !== id) });
+              persistTransactions(transactions.filter((t) => t.id !== id));
             }}
             onAddTransaction={(tx, accountUsed) => {
-              const changes = { transactions: [...transactions, tx] };
-              if (accountUsed && !config.accounts.includes(accountUsed))
-                changes.config = { ...config, accounts: [...config.accounts, accountUsed] };
-              persistData(changes);
+              persistTransactions([...transactions, tx]);
+              if (accountUsed && !config.accounts.includes(accountUsed)) {
+                persistConfig({ ...config, accounts: [...config.accounts, accountUsed] });
+              }
             }}
           />
         )}
@@ -919,10 +831,10 @@ export default function FinanceTracker() {
             onImport={(newTx, accountUsed) => {
               const existingIds = new Set(transactions.map((t) => t.id));
               const toAdd = newTx.filter((t) => !existingIds.has(t.id));
-              const changes = { transactions: [...transactions, ...toAdd] };
-              if (accountUsed && !config.accounts.includes(accountUsed))
-                changes.config = { ...config, accounts: [...config.accounts, accountUsed] };
-              persistData(changes);
+              persistTransactions([...transactions, ...toAdd]);
+              if (accountUsed && !config.accounts.includes(accountUsed)) {
+                persistConfig({ ...config, accounts: [...config.accounts, accountUsed] });
+              }
               setView("dashboard");
               const ms = Array.from(new Set(toAdd.map((t) => t.month))).sort().reverse();
               if (ms.length) setSelectedMonth(ms[0]);
@@ -930,13 +842,13 @@ export default function FinanceTracker() {
           />
         )}
         {view === "rules" && (
-          <RulesView config={config} onChange={(next) => persistData({ config: next })} />
+          <RulesView config={config} onChange={(next) => persistConfig(next)} />
         )}
         {view === "accounts" && (
           <AccountsView
             config={config}
             transactions={transactions}
-            onChangeConfig={(next) => persistData({ config: next })}
+            onChangeConfig={(next) => persistConfig(next)}
           />
         )}
         {view === "insights" && (

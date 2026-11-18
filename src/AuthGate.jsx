@@ -1,56 +1,17 @@
 import React, { useEffect, useState } from "react";
 import { supabase } from "./supabaseClient.js";
-import { setStorageUser } from "./storageShim.js";
-
-const LOCAL_PREFIX = "libro-mastro:";
-
-function hasLocalData() {
-  for (let i = 0; i < localStorage.length; i++) {
-    if (localStorage.key(i)?.startsWith(LOCAL_PREFIX)) return true;
-  }
-  return false;
-}
-
-async function migrateLocalData(userId) {
-  const entries = [];
-  for (let i = 0; i < localStorage.length; i++) {
-    const k = localStorage.key(i);
-    if (k && k.startsWith(LOCAL_PREFIX)) {
-      entries.push({
-        user_id: userId,
-        key: k.slice(LOCAL_PREFIX.length),
-        value: localStorage.getItem(k),
-        updated_at: new Date().toISOString(),
-      });
-    }
-  }
-  if (!entries.length) return 0;
-  const { error } = await supabase
-    .from("kv_store")
-    .upsert(entries, { onConflict: "user_id,key" });
-  if (error) throw error;
-  return entries.length;
-}
 
 export default function AuthGate({ children }) {
   const [session, setSession] = useState(undefined); // undefined = ancora in caricamento
   const [email, setEmail] = useState("");
   const [sent, setSent] = useState(false);
   const [error, setError] = useState("");
-  const [migrated, setMigrated] = useState(false);
-  const [migrating, setMigrating] = useState(false);
 
   useEffect(() => {
     supabase.auth.getSession().then(({ data }) => setSession(data.session));
     const { data: listener } = supabase.auth.onAuthStateChange((_event, s) => setSession(s));
     return () => listener.subscription.unsubscribe();
   }, []);
-
-  // Impostato direttamente nel corpo del componente (non in un effect) così
-  // è già pronto prima che i figli (il portale) montino e leggano i dati.
-  if (session && session.user) {
-    setStorageUser(session.user.id);
-  }
 
   const sendLink = async (e) => {
     e.preventDefault();
@@ -61,19 +22,6 @@ export default function AuthGate({ children }) {
     });
     if (error) setError(error.message);
     else setSent(true);
-  };
-
-  const runMigration = async () => {
-    setMigrating(true);
-    setError("");
-    try {
-      await migrateLocalData(session.user.id);
-      setMigrated(true);
-    } catch (e) {
-      setError("Migrazione non riuscita: " + e.message);
-    } finally {
-      setMigrating(false);
-    }
   };
 
   if (session === undefined) {
@@ -156,50 +104,7 @@ export default function AuthGate({ children }) {
     );
   }
 
-  return (
-    <>
-      {hasLocalData() && !migrated && (
-        <div
-          style={{
-            background: "#FFF7E6",
-            padding: "10px 16px",
-            fontSize: 13,
-            display: "flex",
-            alignItems: "center",
-            gap: 10,
-            justifyContent: "center",
-            flexWrap: "wrap",
-            color: "#6B5B33",
-          }}
-        >
-          Ho trovato dati salvati in questo browser da prima del login.
-          <button
-            onClick={runMigration}
-            disabled={migrating}
-            style={{
-              padding: "4px 10px",
-              borderRadius: 6,
-              border: "1px solid #C6924A",
-              background: "#fff",
-              cursor: "pointer",
-              fontSize: 13,
-            }}
-          >
-            {migrating ? "Importazione…" : "Importali nel tuo account"}
-          </button>
-        </div>
-      )}
-      {migrated && (
-        <div style={{ background: "#E4F1EA", padding: "8px 16px", fontSize: 13, textAlign: "center", color: "#2E8F6F" }}>
-          Dati importati! Ricarica la pagina per vederli.
-        </div>
-      )}
-      {error && (
-        <div style={{ background: "#F6E5E1", padding: "8px 16px", fontSize: 13, textAlign: "center", color: "#C2513F" }}>
-          {error}
-        </div>
-      )}
-      {children}
-    </>
-  );
+  // I figli leggono i dati applicativi direttamente da Supabase. Non viene
+  // letto, importato o sincronizzato alcun dato applicativo dal browser.
+  return children;
 }
